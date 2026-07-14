@@ -20,11 +20,20 @@ NC='\033[0m' # No Color
 # Pinned core versions
 XRAY_VERSION="v26.3.27"
 HYSTERIA_VERSION="v2.9.3"
+TUN2SOCKS_VERSION="v2.7.0"
 
 # Paths
 CORE_DIR="/usr/local/bin/wild-xray"
 CONF_DIR="/etc/wild-tunnel"
 SERVICE="wild-tunnel"
+FWD_SERVICE="wild-forward"
+
+# Local port-forwarding (Xray engine) settings
+SOCKS_PORT="10808"            # local-only SOCKS inbound that tun2socks feeds
+TUN_NAME="wildtun0"           # TUN device created on the local (Iran) side
+TUN_ADDR="198.18.0.1"         # address assigned to the TUN device
+TUN_CIDR="15"                 # 198.18.0.0/15 (RFC 2544 benchmarking range)
+SENTINEL_IP="198.18.0.2"      # DNAT target routed into the TUN (ignored by remote)
 
 # Runtime state
 ENGINE="xray"                 # xray | hysteria
@@ -67,7 +76,7 @@ ensure_prerequisites() {
     echo -e "${GREEN}Updating package lists and installing prerequisites...${NC}"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -q || die "apt-get update failed"
-    apt-get install -y unzip uuid-runtime jq openssl wget curl ca-certificates iproute2 cron \
+    apt-get install -y unzip uuid-runtime jq openssl wget curl ca-certificates iproute2 iptables cron \
         || die "Failed to install prerequisites"
     # Make sure the cron daemon is running so scheduled restarts work.
     systemctl enable --now cron >/dev/null 2>&1 || true
@@ -103,6 +112,19 @@ install_hysteria() {
         || die "Failed to download Hysteria2 core"
     chmod +x "$CORE_DIR/hysteria"
     [ -x "$CORE_DIR/hysteria" ] || die "Hysteria binary is missing after installation"
+}
+
+install_tun2socks() {
+    echo -e "${GREEN}Installing tun2socks (${TUN2SOCKS_VERSION})...${NC}"
+    mkdir -p "$CORE_DIR"
+    wget -qO /tmp/tun2socks.zip "https://github.com/xjasonlyu/tun2socks/releases/download/${TUN2SOCKS_VERSION}/tun2socks-linux-amd64.zip" \
+        || die "Failed to download tun2socks"
+    unzip -qo /tmp/tun2socks.zip -d "$CORE_DIR/" || die "Failed to extract tun2socks"
+    rm -f /tmp/tun2socks.zip
+    # The archive ships the binary as tun2socks-linux-amd64; normalise the name.
+    [ -f "$CORE_DIR/tun2socks-linux-amd64" ] && mv -f "$CORE_DIR/tun2socks-linux-amd64" "$CORE_DIR/tun2socks"
+    chmod +x "$CORE_DIR/tun2socks"
+    [ -x "$CORE_DIR/tun2socks" ] || die "tun2socks binary is missing after installation"
 }
 
 install_core() {
@@ -165,7 +187,10 @@ GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 CONF_DIR="/etc/wild-tunnel"
 CORE_DIR="/usr/local/bin/wild-xray"
 SERVICE="wild-tunnel"
+FWD_SERVICE="wild-forward"
 CRON_TAG="# wild-tunnel-restart"
+
+has_forward() { [ -f /etc/systemd/system/${FWD_SERVICE}.service ]; }
 
 remove_cron() { crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab - 2>/dev/null; }
 
@@ -203,15 +228,23 @@ echo "9) Uninstall"
 read -p "Select [1-9]: " opt
 
 case $opt in
-    1) systemctl status "$SERVICE" --no-pager ;;
-    2) systemctl restart "$SERVICE" && echo -e "${GREEN}Restarted.${NC}" ;;
-    3) systemctl stop "$SERVICE" && echo -e "${GREEN}Stopped.${NC}" ;;
-    4) systemctl start "$SERVICE" && echo -e "${GREEN}Started.${NC}" ;;
+    1) systemctl status "$SERVICE" --no-pager
+       has_forward && { echo; systemctl status "$FWD_SERVICE" --no-pager; } ;;
+    2) systemctl restart "$SERVICE"; has_forward && systemctl restart "$FWD_SERVICE"
+       echo -e "${GREEN}Restarted.${NC}" ;;
+    3) systemctl stop "$SERVICE"; has_forward && systemctl stop "$FWD_SERVICE"
+       echo -e "${GREEN}Stopped.${NC}" ;;
+    4) systemctl start "$SERVICE"; has_forward && systemctl start "$FWD_SERVICE"
+       echo -e "${GREEN}Started.${NC}" ;;
     5) journalctl -u "$SERVICE" -f ;;
     6) cat "$CONF_DIR"/config.* 2>/dev/null || echo -e "${RED}No config found.${NC}" ;;
     7) schedule_restart ;;
     8) remove_cron && echo -e "${GREEN}Scheduled restart removed.${NC}" ;;
-    9) systemctl stop "$SERVICE" 2>/dev/null
+    9) systemctl stop "$FWD_SERVICE" 2>/dev/null
+       systemctl disable "$FWD_SERVICE" 2>/dev/null
+       [ -f "$CONF_DIR/forward-down.sh" ] && bash "$CONF_DIR/forward-down.sh" 2>/dev/null
+       rm -f /etc/systemd/system/${FWD_SERVICE}.service
+       systemctl stop "$SERVICE" 2>/dev/null
        systemctl disable "$SERVICE" 2>/dev/null
        remove_cron
        rm -f /etc/systemd/system/${SERVICE}.service
@@ -219,6 +252,7 @@ case $opt in
        rm -rf "$CORE_DIR" "$CONF_DIR"
        systemctl daemon-reload
        systemctl reset-failed "$SERVICE" 2>/dev/null
+       systemctl reset-failed "$FWD_SERVICE" 2>/dev/null
        rm -f /usr/local/bin/wild
        echo -e "${GREEN}Uninstallation complete.${NC}" ;;
     *) echo -e "${RED}Invalid option.${NC}" ;;
@@ -230,6 +264,26 @@ WILDCMD
 
 generate_uuid() { uuidgen; }
 generate_password() { tr -dc A-Za-z0-9 </dev/urandom | head -c 16; }
+
+# Ask for the single port the tunnel itself listens on / dials.
+prompt_tunnel_port() {
+    while true; do
+        read -p "Enter Tunnel Port (1-65535): " TUNNEL_PORT
+        if [[ "$TUNNEL_PORT" =~ ^[0-9]+$ ]] && [ "$TUNNEL_PORT" -ge 1 ] && [ "$TUNNEL_PORT" -le 65535 ]; then
+            break
+        fi
+        echo -e "${RED}Invalid port. Enter a number between 1 and 65535.${NC}"
+    done
+}
+
+# Ask for the ports that should be forwarded through the tunnel (local side).
+prompt_forward_ports() {
+    while true; do
+        read -p "Enter ports to forward (comma separated, e.g., 2053,8443): " FORWARD_PORTS
+        [ -n "$FORWARD_PORTS" ] && break
+        echo -e "${RED}You must enter at least one port.${NC}"
+    done
+}
 
 # ---------------------------------------------------------------------------
 # Credential / cipher prompts
@@ -667,7 +721,7 @@ create_remote_config() {
       "sniffing": { "enabled": false }
     }
   ],
-  "outbounds": [ { "protocol": "freedom", "settings": {} } ]
+  "outbounds": [ { "protocol": "freedom", "settings": { "redirect": "127.0.0.1:0" } } ]
 }
 EOF
 }
@@ -693,7 +747,7 @@ obfs:
 tcpForwarding:
 EOF
 
-    IFS=',' read -ra PORT_ARRAY <<< "$TUNNEL_PORTS"
+    IFS=',' read -ra PORT_ARRAY <<< "$FORWARD_PORTS"
     for port in "${PORT_ARRAY[@]}"; do
         port=$(echo "$port" | tr -d ' ')
         [ -z "$port" ] && continue
@@ -717,7 +771,7 @@ EOF
 }
 
 create_local_config() {
-    read -p "Enter ports to tunnel (comma separated, e.g., 2053,8443): " TUNNEL_PORTS
+    prompt_forward_ports
 
     if [[ "$ENGINE" == "hysteria" ]]; then
         read -p "Does the Remote Server use a REAL Domain Name for TLS? (y/n): " HAS_REAL_DOMAIN
@@ -763,10 +817,21 @@ create_local_config() {
         stream="\"network\": \"tcp\", \"security\": \"none\""
     fi
 
+    # A local-only SOCKS inbound is the entry point that tun2socks feeds; its
+    # traffic flows out through the encrypted tunnel outbound below.
     cat <<EOF > "$CONF_DIR/config.json"
 {
   "log": { "loglevel": "warning" },
-  "inbounds": [],
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "port": $SOCKS_PORT,
+      "protocol": "socks",
+      "settings": { "auth": "noauth", "udp": true },
+      "sniffing": { "enabled": false }
+    }
+  ],
   "outbounds": [
     {
       "protocol": "$PROTOCOL",
@@ -777,16 +842,104 @@ create_local_config() {
 }
 EOF
 
-    IFS=',' read -ra PORT_ARRAY <<< "$TUNNEL_PORTS"
+    install_tun2socks
+    write_forward_scripts
+}
+
+# Generate the up/down scripts that build the TUN device + iptables rules so the
+# chosen ports are forwarded through the tunnel (system-level, no dokodemo-door).
+write_forward_scripts() {
+    local ports_line=""
+    IFS=',' read -ra PORT_ARRAY <<< "$FORWARD_PORTS"
     for port in "${PORT_ARRAY[@]}"; do
         port=$(echo "$port" | tr -d ' ')
         [ -z "$port" ] && continue
+        [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] \
+            || die "Invalid forward port: $port"
         check_port "$port"
-        jq --argjson p "$port" '.inbounds += [{"port": $p, "listen": "0.0.0.0", "protocol": "dokodemo-door", "settings": {"address": "127.0.0.1", "port": $p, "network": "tcp,udp"}, "sniffing": {"enabled": false}}]' \
-            "$CONF_DIR/config.json" > "$CONF_DIR/config.tmp.json" \
-            && mv "$CONF_DIR/config.tmp.json" "$CONF_DIR/config.json" \
-            || die "Failed to add dokodemo-door inbound for port $port"
+        ports_line="$ports_line $port"
     done
+    ports_line="${ports_line# }"
+    [ -n "$ports_line" ] || die "No valid forward ports provided"
+
+    cat <<EOF > "$CONF_DIR/forward-up.sh"
+#!/bin/bash
+# Auto-generated by Wild Tunnel installer. Brings up the forwarding TUN + rules.
+TUN="$TUN_NAME"
+TUN_CIDR_ADDR="$TUN_ADDR/$TUN_CIDR"
+SENTINEL="$SENTINEL_IP"
+PORTS=($ports_line)
+EOF
+    cat <<'EOF' >> "$CONF_DIR/forward-up.sh"
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1
+sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1
+
+if ! ip link show "$TUN" >/dev/null 2>&1; then
+    ip tuntap add mode tun dev "$TUN"
+fi
+ip addr replace "$TUN_CIDR_ADDR" dev "$TUN"
+ip link set dev "$TUN" up
+
+ensure() { local t="$1" c="$2"; shift 2; iptables -t "$t" -C "$c" "$@" 2>/dev/null || iptables -t "$t" -A "$c" "$@"; }
+
+for p in "${PORTS[@]}"; do
+    ensure nat PREROUTING -p tcp --dport "$p" -j DNAT --to-destination "$SENTINEL:$p" -m comment --comment wild-tunnel
+    ensure nat PREROUTING -p udp --dport "$p" -j DNAT --to-destination "$SENTINEL:$p" -m comment --comment wild-tunnel
+done
+ensure nat POSTROUTING -o "$TUN" -j MASQUERADE -m comment --comment wild-tunnel
+ensure filter FORWARD -o "$TUN" -j ACCEPT -m comment --comment wild-tunnel
+ensure filter FORWARD -i "$TUN" -j ACCEPT -m comment --comment wild-tunnel
+EOF
+    chmod +x "$CONF_DIR/forward-up.sh"
+
+    cat <<EOF > "$CONF_DIR/forward-down.sh"
+#!/bin/bash
+# Auto-generated by Wild Tunnel installer. Tears down the forwarding TUN + rules.
+TUN="$TUN_NAME"
+SENTINEL="$SENTINEL_IP"
+PORTS=($ports_line)
+EOF
+    cat <<'EOF' >> "$CONF_DIR/forward-down.sh"
+for p in "${PORTS[@]}"; do
+    iptables -t nat -D PREROUTING -p tcp --dport "$p" -j DNAT --to-destination "$SENTINEL:$p" -m comment --comment wild-tunnel 2>/dev/null
+    iptables -t nat -D PREROUTING -p udp --dport "$p" -j DNAT --to-destination "$SENTINEL:$p" -m comment --comment wild-tunnel 2>/dev/null
+done
+iptables -t nat -D POSTROUTING -o "$TUN" -j MASQUERADE -m comment --comment wild-tunnel 2>/dev/null
+iptables -D FORWARD -o "$TUN" -j ACCEPT -m comment --comment wild-tunnel 2>/dev/null
+iptables -D FORWARD -i "$TUN" -j ACCEPT -m comment --comment wild-tunnel 2>/dev/null
+ip link set dev "$TUN" down 2>/dev/null
+ip link del "$TUN" 2>/dev/null
+EOF
+    chmod +x "$CONF_DIR/forward-down.sh"
+}
+
+# Install + start the tun2socks service that pumps the TUN device into the SOCKS
+# inbound (which is chained to the encrypted tunnel outbound).
+setup_forward_service() {
+    echo -e "${GREEN}Setting up port-forwarding service (${FWD_SERVICE})...${NC}"
+    cat <<EOF > /etc/systemd/system/${FWD_SERVICE}.service
+[Unit]
+Description=Wild Tunnel Port Forwarder
+After=network.target ${SERVICE}.service
+Requires=${SERVICE}.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/bash $CONF_DIR/forward-up.sh
+ExecStart=$CORE_DIR/tun2socks --device $TUN_NAME --proxy socks5://127.0.0.1:$SOCKS_PORT --loglevel warning
+ExecStopPost=/bin/bash $CONF_DIR/forward-down.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "$FWD_SERVICE"
+    systemctl restart "$FWD_SERVICE"
+    echo -e "${GREEN}Port forwarder started.${NC}"
+    systemctl status "$FWD_SERVICE" --no-pager | head -n 10
 }
 
 print_remote_summary() {
@@ -844,9 +997,14 @@ elif [ "$role_option" == "2" ]; then
     install_core
     create_local_config
     setup_service
+    [[ "$ENGINE" == "xray" ]] && setup_forward_service
 
 elif [ "$role_option" == "3" ]; then
     echo -e "${RED}Uninstalling Wild Tunnel...${NC}"
+    systemctl stop "$FWD_SERVICE" 2>/dev/null
+    systemctl disable "$FWD_SERVICE" 2>/dev/null
+    [ -f "$CONF_DIR/forward-down.sh" ] && bash "$CONF_DIR/forward-down.sh" 2>/dev/null
+    rm -f /etc/systemd/system/${FWD_SERVICE}.service
     systemctl stop "$SERVICE" 2>/dev/null
     systemctl disable "$SERVICE" 2>/dev/null
     crontab -l 2>/dev/null | grep -v '# wild-tunnel-restart' | crontab - 2>/dev/null
@@ -857,6 +1015,7 @@ elif [ "$role_option" == "3" ]; then
     rm -f /usr/local/bin/wild
     systemctl daemon-reload
     systemctl reset-failed "$SERVICE" 2>/dev/null
+    systemctl reset-failed "$FWD_SERVICE" 2>/dev/null
     echo -e "${GREEN}Uninstallation complete.${NC}"
     echo "Note: the Sanaei/3x-ui panel (if installed) was not touched."
 else
