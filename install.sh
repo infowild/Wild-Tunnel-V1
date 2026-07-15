@@ -1593,22 +1593,43 @@ refresh_shortcut_if_installed() {
 
 main_menu() {
     refresh_shortcut_if_installed
+    local installed=0
     while true; do
         show_banner
+        { [ -f "$CONF_DIR/config.json" ] || [ -f "$CONF_DIR/config.yaml" ]; } && installed=1 || installed=0
         echo "1) Install Remote Server (Foreign - Receiver)"
         echo "2) Install Local Server (Iran - Forwarder)"
-        echo "3) Edit Configuration"
-        echo "4) Management menu (post-install)"
-        echo "5) Uninstall Wild Tunnel"
-        echo "6) Exit"
-        read -p "Select an option [1-6]: " role_option
+        [ "$installed" -eq 1 ] && echo "3) Management menu (post-install)"
+        if [ "$installed" -eq 1 ]; then
+            echo "4) Uninstall Wild Tunnel"
+            echo "5) Exit"
+        else
+            echo "3) Uninstall Wild Tunnel"
+            echo "4) Exit"
+        fi
+        read -p "Select an option: " role_option
         case "$role_option" in
             1) do_remote_setup && post_install_menu ;;
             2) do_local_setup && post_install_menu ;;
-            3) do_edit; pause_enter ;;
-            4) post_install_menu ;;
-            5) do_uninstall; pause_enter ;;
-            6) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
+            3)
+                if [ "$installed" -eq 1 ]; then
+                    post_install_menu
+                else
+                    do_uninstall; pause_enter
+                fi
+                ;;
+            4)
+                if [ "$installed" -eq 1 ]; then
+                    do_uninstall; pause_enter
+                else
+                    echo -e "${GREEN}Goodbye!${NC}"; exit 0
+                fi
+                ;;
+            5)
+                [ "$installed" -eq 1 ] && { echo -e "${GREEN}Goodbye!${NC}"; exit 0; } \
+                    || echo -e "${RED}Invalid option selected.${NC}"
+                pause_enter
+                ;;
             *) echo -e "${RED}Invalid option selected.${NC}"; pause_enter ;;
         esac
     done
