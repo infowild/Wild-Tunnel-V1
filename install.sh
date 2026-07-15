@@ -50,8 +50,11 @@ GRPC_SERVICE="grpc"
 HTTP_PATH="/"
 HTTP_HOST=""
 # REALITY material
-REALITY_DEST="www.microsoft.com:443"
-REALITY_SNI="www.microsoft.com"
+# NOTE: dest MUST be a TLS1.3 site with a SMALL (ECDSA) certificate chain.
+# Large RSA chains (e.g. www.microsoft.com from some regions) overflow REALITY's
+# handshake buffer and cause "handshake did not complete successfully".
+REALITY_DEST="dl.google.com:443"
+REALITY_SNI="dl.google.com"
 REALITY_PRIVATE=""
 REALITY_PUBLIC=""
 REALITY_SHORTID=""
@@ -425,10 +428,11 @@ prompt_vless_encryption() {
 # ---------------------------------------------------------------------------
 
 gen_reality_keys() {
-    read -p "REALITY dest (camouflage site) [Default: www.microsoft.com:443]: " REALITY_DEST
-    REALITY_DEST=${REALITY_DEST:-www.microsoft.com:443}
-    read -p "REALITY serverName/SNI [Default: www.microsoft.com]: " REALITY_SNI
-    REALITY_SNI=${REALITY_SNI:-www.microsoft.com}
+    echo -e "${YELLOW}Tip: REALITY dest must use TLS1.3 with a SMALL cert (ECDSA). Good: dl.google.com, www.cloudflare.com. Avoid big RSA chains like www.microsoft.com.${NC}"
+    read -p "REALITY dest (camouflage site) [Default: dl.google.com:443]: " REALITY_DEST
+    REALITY_DEST=${REALITY_DEST:-dl.google.com:443}
+    read -p "REALITY serverName/SNI [Default: dl.google.com]: " REALITY_SNI
+    REALITY_SNI=${REALITY_SNI:-dl.google.com}
 
     local out
     out=$("$CORE_DIR/xray" x25519) || die "xray x25519 failed"
