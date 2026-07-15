@@ -245,15 +245,39 @@ install_shortcut() {
     # from anywhere after installation.
     cat <<'WILDCMD' > /usr/local/bin/wild
 #!/bin/bash
-GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; CYAN='\033[1;36m'; BOLD='\033[1m'; NC='\033[0m'
 CONF_DIR="/etc/wild-tunnel"
 CORE_DIR="/usr/local/bin/wild-xray"
 SERVICE="wild-tunnel"
 FWD_SERVICE="wild-forward"
 CRON_TAG="# wild-tunnel-restart"
 
-has_forward() { [ -f /etc/systemd/system/${FWD_SERVICE}.service ]; }
+show_banner() {
+    clear 2>/dev/null
+    echo -e "${CYAN}"
+    cat <<'BANNER'
+   ██╗    ██╗██╗██╗     ██████╗
+   ██║    ██║██║██║     ██╔══██╗
+   ██║ █╗ ██║██║██║     ██║  ██║
+   ██║███╗██║██║██║     ██║  ██║
+   ╚███╔███╔╝██║███████╗██████╔╝
+    ╚══╝╚══╝ ╚═╝╚══════╝╚═════╝
+   ████████╗██╗   ██╗███╗   ██╗███╗   ██╗███████╗██╗
+   ╚══██╔══╝██║   ██║████╗  ██║████╗  ██║██╔════╝██║
+      ██║   ██║   ██║██╔██╗ ██║██╔██╗ ██║█████╗  ██║
+      ██║   ██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║
+      ██║   ╚██████╔╝██║ ╚████║██║ ╚████║███████╗███████╗
+      ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
+BANNER
+    echo -e "${NC}"
+    echo -e "${BOLD}${YELLOW}        «  W I L D   T U N N E L   ·   V 1  »${NC}"
+    echo -e "${GREEN}     GitHub: ${NC}${BOLD}https://github.com/infowild/Wild-Tunnel-V1${NC}"
+    echo -e "${CYAN}   ────────────────────────────────────────────────────────${NC}"
+    echo
+}
 
+pause_enter() { echo; read -p "Press Enter to continue..." _; }
+has_forward() { [ -f /etc/systemd/system/${FWD_SERVICE}.service ]; }
 remove_cron() { crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab - 2>/dev/null; }
 
 schedule_restart() {
@@ -277,48 +301,57 @@ schedule_restart() {
         && echo -e "${GREEN}Scheduled: '$expr' -> restart $SERVICE${NC}"
 }
 
-echo -e "${GREEN}Wild Tunnel Management${NC}"
-echo "1) Status"
-echo "2) Restart (manual)"
-echo "3) Stop"
-echo "4) Start"
-echo "5) Live logs"
-echo "6) Show config"
-echo "7) Schedule auto-restart (cron)"
-echo "8) Remove scheduled restart"
-echo "9) Uninstall"
-read -p "Select [1-9]: " opt
+do_uninstall() {
+    systemctl stop "$FWD_SERVICE" 2>/dev/null
+    systemctl disable "$FWD_SERVICE" 2>/dev/null
+    [ -f "$CONF_DIR/forward-down.sh" ] && bash "$CONF_DIR/forward-down.sh" 2>/dev/null
+    rm -f /etc/systemd/system/${FWD_SERVICE}.service
+    systemctl stop "$SERVICE" 2>/dev/null
+    systemctl disable "$SERVICE" 2>/dev/null
+    remove_cron
+    rm -f /etc/systemd/system/${SERVICE}.service
+    rm -f /etc/letsencrypt/renewal-hooks/deploy/wild-tunnel.sh
+    rm -rf "$CORE_DIR" "$CONF_DIR"
+    systemctl daemon-reload
+    systemctl reset-failed "$SERVICE" 2>/dev/null
+    systemctl reset-failed "$FWD_SERVICE" 2>/dev/null
+    rm -f /usr/local/bin/wild
+    echo -e "${GREEN}Uninstallation complete.${NC}"
+}
 
-case $opt in
-    1) systemctl status "$SERVICE" --no-pager
-       has_forward && { echo; systemctl status "$FWD_SERVICE" --no-pager; } ;;
-    2) systemctl restart "$SERVICE"; has_forward && systemctl restart "$FWD_SERVICE"
-       echo -e "${GREEN}Restarted.${NC}" ;;
-    3) systemctl stop "$SERVICE"; has_forward && systemctl stop "$FWD_SERVICE"
-       echo -e "${GREEN}Stopped.${NC}" ;;
-    4) systemctl start "$SERVICE"; has_forward && systemctl start "$FWD_SERVICE"
-       echo -e "${GREEN}Started.${NC}" ;;
-    5) journalctl -u "$SERVICE" -f ;;
-    6) cat "$CONF_DIR"/config.* 2>/dev/null || echo -e "${RED}No config found.${NC}" ;;
-    7) schedule_restart ;;
-    8) remove_cron && echo -e "${GREEN}Scheduled restart removed.${NC}" ;;
-    9) systemctl stop "$FWD_SERVICE" 2>/dev/null
-       systemctl disable "$FWD_SERVICE" 2>/dev/null
-       [ -f "$CONF_DIR/forward-down.sh" ] && bash "$CONF_DIR/forward-down.sh" 2>/dev/null
-       rm -f /etc/systemd/system/${FWD_SERVICE}.service
-       systemctl stop "$SERVICE" 2>/dev/null
-       systemctl disable "$SERVICE" 2>/dev/null
-       remove_cron
-       rm -f /etc/systemd/system/${SERVICE}.service
-       rm -f /etc/letsencrypt/renewal-hooks/deploy/wild-tunnel.sh
-       rm -rf "$CORE_DIR" "$CONF_DIR"
-       systemctl daemon-reload
-       systemctl reset-failed "$SERVICE" 2>/dev/null
-       systemctl reset-failed "$FWD_SERVICE" 2>/dev/null
-       rm -f /usr/local/bin/wild
-       echo -e "${GREEN}Uninstallation complete.${NC}" ;;
-    *) echo -e "${RED}Invalid option.${NC}" ;;
-esac
+while true; do
+    show_banner
+    echo -e "${GREEN}Wild Tunnel Management${NC}"
+    echo "1) Status"
+    echo "2) Restart"
+    echo "3) Stop"
+    echo "4) Start"
+    echo "5) Live logs (Ctrl+C to exit)"
+    echo "6) Show config"
+    echo "7) Schedule auto-restart (cron)"
+    echo "8) Remove scheduled restart"
+    echo "9) Uninstall"
+    echo "0) Exit"
+    read -p "Select an option [0-9]: " opt
+    case $opt in
+        1) systemctl status "$SERVICE" --no-pager | head -n 15
+           has_forward && { echo; systemctl status "$FWD_SERVICE" --no-pager | head -n 15; } ;;
+        2) systemctl restart "$SERVICE"; has_forward && systemctl restart "$FWD_SERVICE"
+           echo -e "${GREEN}Restarted.${NC}" ;;
+        3) systemctl stop "$SERVICE"; has_forward && systemctl stop "$FWD_SERVICE"
+           echo -e "${YELLOW}Stopped.${NC}" ;;
+        4) systemctl start "$SERVICE"; has_forward && systemctl start "$FWD_SERVICE"
+           echo -e "${GREEN}Started.${NC}" ;;
+        5) echo -e "${YELLOW}Live logs. Press Ctrl+C to stop.${NC}"; journalctl -u "$SERVICE" -f ;;
+        6) cat "$CONF_DIR"/config.* 2>/dev/null || echo -e "${RED}No config found.${NC}" ;;
+        7) schedule_restart ;;
+        8) remove_cron && echo -e "${GREEN}Scheduled restart removed.${NC}" ;;
+        9) do_uninstall; pause_enter; exit 0 ;;
+        0) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
+        *) echo -e "${RED}Invalid option.${NC}" ;;
+    esac
+    pause_enter
+done
 WILDCMD
     chmod +x /usr/local/bin/wild
     echo -e "${GREEN}Shortcut installed: run 'wild' to manage the tunnel.${NC}"
@@ -1550,7 +1583,16 @@ post_install_menu() {
 # Main menu (loops until Exit)
 # ---------------------------------------------------------------------------
 
+# If a tunnel is already installed, refresh the `wild` shortcut so an existing
+# installation immediately picks up this version's new management menu/banner.
+refresh_shortcut_if_installed() {
+    { [ -f "$CONF_DIR/config.json" ] || [ -f "$CONF_DIR/config.yaml" ]; } \
+        && install_shortcut >/dev/null 2>&1
+    return 0
+}
+
 main_menu() {
+    refresh_shortcut_if_installed
     while true; do
         show_banner
         echo "1) Install Remote Server (Foreign - Receiver)"
