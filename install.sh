@@ -154,6 +154,8 @@ install_hysteria() {
 }
 
 install_tun2socks() {
+    # Already present (e.g. during an edit/apply): keep the pinned binary.
+    [ -x "$CORE_DIR/tun2socks" ] && return 0
     echo -e "${GREEN}Installing tun2socks (${TUN2SOCKS_VERSION})...${NC}"
     mkdir -p "$CORE_DIR"
     wget -qO /tmp/tun2socks.zip "https://github.com/xjasonlyu/tun2socks/releases/download/${TUN2SOCKS_VERSION}/tun2socks-linux-amd64.zip" \
@@ -171,6 +173,17 @@ install_core() {
         install_hysteria
     else
         install_xray
+    fi
+}
+
+# Like install_core but skips the download when the needed binary already
+# exists. Used by the edit/apply path so editing a port does not re-download.
+ensure_core() {
+    mkdir -p "$CORE_DIR" "$CONF_DIR"
+    if [[ "$ENGINE" == "hysteria" ]]; then
+        [ -x "$CORE_DIR/hysteria" ] || install_hysteria
+    else
+        [ -x "$CORE_DIR/xray" ] || install_xray
     fi
 }
 
@@ -683,14 +696,20 @@ create_remote_config() {
         return
     fi
 
-    # Security material for stream-capable protocols
+    # Security material for stream-capable protocols. Existing material is
+    # reused (important for edits: regenerating REALITY keys would break the
+    # already-configured local side). Material is (re)generated only when it is
+    # missing, or when an edit explicitly cleared it to request a refresh.
     if is_stream_protocol; then
         if [[ "$SECURITY" == "tls" ]]; then
             make_certs
         elif [[ "$SECURITY" == "reality" ]]; then
-            make_reality_keys
+            [ -z "$REALITY_PRIVATE" ] && make_reality_keys
+            [ -z "$REALITY_SHORTID" ] && REALITY_SHORTID=$(openssl rand -hex 8)
         fi
-        [[ "$PROTOCOL" == "vless" && "$VLESS_ENC" == "on" ]] && gen_vless_enc
+        if [[ "$PROTOCOL" == "vless" && "$VLESS_ENC" == "on" ]]; then
+            { [ -z "$VLESS_DECRYPTION" ] || [ "$VLESS_DECRYPTION" == "none" ]; } && gen_vless_enc
+        fi
     fi
 
     local settings stream
@@ -949,6 +968,59 @@ reset_state() {
     FORWARD_PORTS=""; REMOTE_IP=""; TUNNEL_PORT=""
 }
 
+# Persist every selection so the configuration can be edited later. This is the
+# single source of truth the "Edit Configuration" menu reads from.
+save_state() {
+    mkdir -p "$CONF_DIR"
+    cat > "$CONF_DIR/wild.conf" <<EOF
+ROLE="$ROLE"
+ENGINE="$ENGINE"
+PROTOCOL="$PROTOCOL"
+TUNNEL_PORT="$TUNNEL_PORT"
+REMOTE_IP="$REMOTE_IP"
+UUID="$UUID"
+PASSWORD="$PASSWORD"
+OBFS_PASS="$OBFS_PASS"
+SS_METHOD="$SS_METHOD"
+VMESS_SECURITY="$VMESS_SECURITY"
+NETWORK="$NETWORK"
+WS_PATH="$WS_PATH"
+HTTP_HOST="$HTTP_HOST"
+GRPC_SERVICE="$GRPC_SERVICE"
+HTTP_PATH="$HTTP_PATH"
+SECURITY="$SECURITY"
+FLOW="$FLOW"
+VLESS_ENC="$VLESS_ENC"
+VLESS_ENCRYPTION="$VLESS_ENCRYPTION"
+VLESS_DECRYPTION="$VLESS_DECRYPTION"
+REALITY_DEST="$REALITY_DEST"
+REALITY_SNI="$REALITY_SNI"
+REALITY_PUBLIC="$REALITY_PUBLIC"
+REALITY_PRIVATE="$REALITY_PRIVATE"
+REALITY_SHORTID="$REALITY_SHORTID"
+REALITY_FINGERPRINT="$REALITY_FINGERPRINT"
+USE_REAL_SSL="$USE_REAL_SSL"
+DOMAIN="$DOMAIN"
+CERT_FILE="$CERT_FILE"
+KEY_FILE="$KEY_FILE"
+SERVER_NAME="$SERVER_NAME"
+ALLOW_INSECURE="$ALLOW_INSECURE"
+LOCAL_SERVER_NAME="$LOCAL_SERVER_NAME"
+LOCAL_ALLOW_INSECURE="$LOCAL_ALLOW_INSECURE"
+FORWARD_PORTS="$FORWARD_PORTS"
+EOF
+    chmod 600 "$CONF_DIR/wild.conf" 2>/dev/null || true
+}
+
+# Load a previously saved configuration into the current shell. Returns 1 when
+# no saved state exists (e.g. installed with an older version, or not installed).
+load_state() {
+    [ -f "$CONF_DIR/wild.conf" ] || return 1
+    # shellcheck disable=SC1090
+    . "$CONF_DIR/wild.conf"
+    return 0
+}
+
 step_tunnel_port() {
     hint_back
     while true; do
@@ -1128,6 +1200,7 @@ do_remote_setup() {
     install_core
     create_remote_config
     setup_service
+    save_state
     print_remote_summary
 }
 
@@ -1146,6 +1219,235 @@ do_local_setup() {
     create_local_config
     setup_service
     [[ "$ENGINE" == "xray" ]] && setup_forward_service
+    save_state
+}
+
+# ---------------------------------------------------------------------------
+# Edit configuration (role-aware: different fields on Iran vs Foreign side)
+# ---------------------------------------------------------------------------
+
+# Generic "keep-or-change" text field. Shows the current value; Enter keeps it,
+# 0 cancels (returns 1), anything else overwrites the variable named in $1.
+edit_field() {
+    local __v="$1" __label="$2" __cur __in
+    __cur="${!__v}"
+    read -p "$__label [current: ${__cur:-<empty>}] (Enter=keep, 0=cancel): " __in
+    [ "$__in" = "0" ] && return 1
+    [ -n "$__in" ] && printf -v "$__v" '%s' "$__in"
+    return 0
+}
+
+edit_tunnel_port() {
+    local new
+    while true; do
+        read -p "Tunnel Port [current: $TUNNEL_PORT] (Enter=keep, 0=cancel): " new
+        [ "$new" = "0" ] && return 1
+        [ -z "$new" ] && return 0
+        if [[ "$new" =~ ^[0-9]+$ ]] && [ "$new" -ge 1 ] && [ "$new" -le 65535 ]; then
+            TUNNEL_PORT="$new"; check_port "$TUNNEL_PORT"; return 0
+        fi
+        echo -e "${RED}Invalid port. Enter 1-65535.${NC}"
+    done
+}
+
+edit_remote_ip()     { edit_field REMOTE_IP "Remote Server IP"; }
+edit_forward_ports() { edit_field FORWARD_PORTS "Forward Ports (comma separated)"; }
+
+# Credentials, with keep-on-Enter semantics (unlike the install steps which
+# auto-generate on blank input).
+edit_credentials() {
+    case "$PROTOCOL" in
+        vless|vmess)
+            edit_field UUID "UUID" || return 1
+            [[ "$PROTOCOL" == "vmess" ]] && { prompt_vmess_security || return 1; }
+            ;;
+        shadowsocks)
+            prompt_ss_method || return 1
+            ;;
+        trojan|socks|hysteria2)
+            edit_field PASSWORD "Password" || return 1
+            [[ "$PROTOCOL" == "hysteria2" ]] && { edit_field OBFS_PASS "Obfuscation Password" || return 1; }
+            ;;
+    esac
+    return 0
+}
+
+# Transmission edit also re-derives the Vision flow (only valid for VLESS over
+# raw TCP with tls/reality and without VLESS Encryption).
+edit_transmission() {
+    prompt_transmission
+    if [[ "$PROTOCOL" == "vless" && "$NETWORK" == "tcp" \
+          && ( "$SECURITY" == "tls" || "$SECURITY" == "reality" ) && "$VLESS_ENC" != "on" ]]; then
+        FLOW="xtls-rprx-vision"
+    else
+        FLOW=""
+    fi
+    return 0
+}
+
+edit_reality_dest() {
+    edit_field REALITY_DEST "REALITY dest (host:port)" || return 1
+    edit_field REALITY_SNI  "REALITY serverName/SNI"   || return 1
+    return 0
+}
+
+edit_tls_domain_remote() {
+    local ans
+    read -p "Use a REAL Let's Encrypt certificate? (y/n) [current: ${USE_REAL_SSL:-n}] (0=cancel): " ans
+    [ "$ans" = "0" ] && return 1
+    [ -n "$ans" ] && USE_REAL_SSL="$ans"
+    if [[ "$USE_REAL_SSL" == "y" || "$USE_REAL_SSL" == "Y" ]]; then
+        edit_field DOMAIN "Domain Name" || return 1
+    fi
+    return 0
+}
+
+edit_client_reality() {
+    edit_field REALITY_SNI         "REALITY serverName/SNI (from remote)" || return 1
+    edit_field REALITY_PUBLIC      "REALITY Public Key (from remote)"     || return 1
+    edit_field REALITY_SHORTID     "REALITY shortId (from remote)"        || return 1
+    edit_field REALITY_FINGERPRINT "uTLS fingerprint"                     || return 1
+    return 0
+}
+
+edit_remote_domain_local() {
+    local ans
+    read -p "Does the Remote use a REAL Domain for TLS? (y/n) [current insecure=$LOCAL_ALLOW_INSECURE] (0=cancel): " ans
+    [ "$ans" = "0" ] && return 1
+    if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
+        edit_field LOCAL_SERVER_NAME "Domain Name" || return 1
+        LOCAL_ALLOW_INSECURE="false"
+    elif [[ "$ans" == "n" || "$ans" == "N" ]]; then
+        LOCAL_SERVER_NAME="bing.com"; LOCAL_ALLOW_INSECURE="true"
+    fi
+    return 0
+}
+
+edit_vless_enc_string() { edit_field VLESS_ENCRYPTION "VLESS Encryption string (from remote)"; }
+
+show_config_brief() {
+    echo -e "${YELLOW}Current:  role=$ROLE  protocol=$PROTOCOL  port=$TUNNEL_PORT  security=${SECURITY:-none}  network=${NETWORK:-tcp}${NC}"
+    [[ "$ROLE" == "local" ]] && \
+        echo -e "${YELLOW}          remote_ip=$REMOTE_IP  forward_ports=$FORWARD_PORTS${NC}"
+}
+
+apply_remote() {
+    echo -e "${GREEN}Applying changes on the Foreign (remote) server...${NC}"
+    ensure_core
+    create_remote_config
+    setup_service
+    save_state
+    print_remote_summary
+}
+
+apply_local() {
+    echo -e "${GREEN}Applying changes on the Iran (local) server...${NC}"
+    ensure_core
+    create_local_config
+    setup_service
+    if [[ "$ENGINE" == "xray" ]]; then
+        setup_forward_service
+    else
+        systemctl stop "$FWD_SERVICE" 2>/dev/null
+        systemctl disable "$FWD_SERVICE" 2>/dev/null
+        [ -f "$CONF_DIR/forward-down.sh" ] && bash "$CONF_DIR/forward-down.sh" 2>/dev/null
+    fi
+    save_state
+    echo -e "${GREEN}Local configuration updated.${NC}"
+}
+
+# Confirm before discarding unapplied edits. Returns 0 when it is OK to leave.
+confirm_discard() {
+    local d
+    [ "$1" -eq 0 ] && return 0
+    read -p "You have unapplied changes. Discard them and go back? (y/n): " d
+    [[ "$d" == "y" || "$d" == "Y" ]]
+}
+
+# --- Foreign (remote) side: no forward ports, no remote IP -----------------
+edit_remote() {
+    local dirty=0 e
+    while true; do
+        echo
+        echo -e "${GREEN}--- Edit Foreign (Remote) Configuration ---${NC}"
+        show_config_brief
+        echo "1) Tunnel Port"
+        echo "2) Protocol (re-configure protocol + credentials + transmission + security)"
+        echo "3) Credentials"
+        is_stream_protocol && echo "4) Transmission (network)"
+        is_stream_protocol && echo "5) Security (+ material)"
+        [[ "$SECURITY" == "reality" ]] && echo "6) REALITY dest / SNI"
+        [[ "$SECURITY" == "reality" ]] && echo "7) Regenerate REALITY keypair"
+        { [[ "$SECURITY" == "tls" ]] || [[ "$ENGINE" == "hysteria" ]]; } && echo "8) TLS certificate / domain"
+        echo -e "${GREEN}a) Apply changes (regenerate config + restart)${NC}"
+        echo "0) Back to main menu"
+        read -p "Select: " e
+        case "$e" in
+            1) edit_tunnel_port && dirty=1 ;;
+            2) run_steps sstep_protocol sstep_creds sstep_transmission sstep_security rstep_secmaterial; dirty=1 ;;
+            3) edit_credentials && dirty=1 ;;
+            4) if is_stream_protocol; then edit_transmission; dirty=1; else echo -e "${RED}Not applicable.${NC}"; fi ;;
+            5) if is_stream_protocol; then run_steps sstep_security rstep_secmaterial; dirty=1; else echo -e "${RED}Not applicable.${NC}"; fi ;;
+            6) if [[ "$SECURITY" == "reality" ]]; then edit_reality_dest && dirty=1; else echo -e "${RED}Not applicable.${NC}"; fi ;;
+            7) if [[ "$SECURITY" == "reality" ]]; then REALITY_PRIVATE=""; REALITY_PUBLIC=""; echo -e "${YELLOW}A fresh keypair will be generated on Apply (update the Iran side afterwards).${NC}"; dirty=1; else echo -e "${RED}Not applicable.${NC}"; fi ;;
+            8) if [[ "$SECURITY" == "tls" || "$ENGINE" == "hysteria" ]]; then edit_tls_domain_remote && dirty=1; else echo -e "${RED}Not applicable.${NC}"; fi ;;
+            a|A) apply_remote; dirty=0 ;;
+            0) confirm_discard "$dirty" && return ;;
+            *) echo -e "${RED}Invalid option.${NC}" ;;
+        esac
+    done
+}
+
+# --- Iran (local) side: has remote IP + forward ports, client-side material -
+edit_local() {
+    local dirty=0 e
+    while true; do
+        echo
+        echo -e "${GREEN}--- Edit Iran (Local) Configuration ---${NC}"
+        show_config_brief
+        echo "1) Remote Server IP"
+        echo "2) Tunnel Port"
+        echo "3) Protocol (re-configure protocol + credentials + transmission + security)"
+        echo "4) Credentials"
+        is_stream_protocol && echo "5) Transmission (network)"
+        is_stream_protocol && echo "6) Security (+ client material)"
+        [[ "$SECURITY" == "reality" ]] && echo "7) REALITY client material (SNI / PublicKey / shortId / fingerprint)"
+        { [[ "$SECURITY" == "tls" ]] || [[ "$ENGINE" == "hysteria" ]]; } && echo "8) Remote TLS domain"
+        [[ "$PROTOCOL" == "vless" && "$VLESS_ENC" == "on" ]] && echo "9) VLESS Encryption string"
+        echo "10) Forward Ports"
+        echo -e "${GREEN}a) Apply changes (regenerate config + restart)${NC}"
+        echo "0) Back to main menu"
+        read -p "Select: " e
+        case "$e" in
+            1) edit_remote_ip && dirty=1 ;;
+            2) edit_tunnel_port && dirty=1 ;;
+            3) run_steps sstep_protocol sstep_creds sstep_transmission sstep_security sstep_vlessenc lstep_client_material; dirty=1 ;;
+            4) edit_credentials && dirty=1 ;;
+            5) if is_stream_protocol; then edit_transmission; dirty=1; else echo -e "${RED}Not applicable.${NC}"; fi ;;
+            6) if is_stream_protocol; then run_steps sstep_security sstep_vlessenc lstep_client_material; dirty=1; else echo -e "${RED}Not applicable.${NC}"; fi ;;
+            7) if [[ "$SECURITY" == "reality" ]]; then edit_client_reality && dirty=1; else echo -e "${RED}Not applicable.${NC}"; fi ;;
+            8) if [[ "$SECURITY" == "tls" || "$ENGINE" == "hysteria" ]]; then edit_remote_domain_local && dirty=1; else echo -e "${RED}Not applicable.${NC}"; fi ;;
+            9) if [[ "$PROTOCOL" == "vless" && "$VLESS_ENC" == "on" ]]; then edit_vless_enc_string && dirty=1; else echo -e "${RED}Not applicable.${NC}"; fi ;;
+            10) edit_forward_ports && dirty=1 ;;
+            a|A) apply_local; dirty=0 ;;
+            0) confirm_discard "$dirty" && return ;;
+            *) echo -e "${RED}Invalid option.${NC}" ;;
+        esac
+    done
+}
+
+do_edit() {
+    if ! load_state; then
+        echo -e "${RED}No saved configuration found at $CONF_DIR/wild.conf.${NC}"
+        echo "Editing is available only for tunnels installed with this version."
+        echo "Please reinstall once (option 1 or 2); afterwards editing will work."
+        return
+    fi
+    case "$ROLE" in
+        remote) edit_remote ;;
+        local)  edit_local ;;
+        *) echo -e "${RED}Saved state has an unknown role ('$ROLE'). Cannot edit.${NC}" ;;
+    esac
 }
 
 do_uninstall() {
@@ -1178,14 +1480,16 @@ main_menu() {
         show_banner
         echo "1) Install Remote Server (Foreign - Receiver)"
         echo "2) Install Local Server (Iran - Forwarder)"
-        echo "3) Uninstall Wild Tunnel"
-        echo "4) Exit"
-        read -p "Select an option [1-4]: " role_option
+        echo "3) Edit Configuration"
+        echo "4) Uninstall Wild Tunnel"
+        echo "5) Exit"
+        read -p "Select an option [1-5]: " role_option
         case "$role_option" in
             1) do_remote_setup ;;
             2) do_local_setup ;;
-            3) do_uninstall ;;
-            4) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
+            3) do_edit ;;
+            4) do_uninstall ;;
+            5) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
             *) echo -e "${RED}Invalid option selected.${NC}" ;;
         esac
         echo
