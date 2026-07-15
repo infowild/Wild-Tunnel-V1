@@ -65,11 +65,47 @@ VLESS_ENCRYPTION="none"
 
 die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
 
-echo -e "${GREEN}Welcome to Wild Tunnel v1 Installer${NC}"
-echo "1) Install Remote Server (Foreign - Receiver)"
-echo "2) Install Local Server (Iran - Forwarder)"
-echo "3) Uninstall Wild Tunnel"
-read -p "Select an option [1-3]: " role_option
+# ---------------------------------------------------------------------------
+# Interactive navigation helpers (step-by-step Back with "0")
+# ---------------------------------------------------------------------------
+BACK_RC=10   # a step returns this when the user pressed 0 (Back)
+SKIP_RC=20   # a step returns this when it does not apply in the current context
+
+# Big symbolic banner shown at the top of the main menu.
+show_banner() {
+    clear 2>/dev/null
+    echo -e "${GREEN}"
+    cat <<'BANNER'
+ ##     ## #### ##       ########     ######## ##     ## ##    ## ##    ## ######## ##
+ ##     ##  ##  ##       ##     ##       ##    ##     ## ###   ## ###   ## ##       ##
+ ##     ##  ##  ##       ##     ##       ##    ##     ## ####  ## ####  ## ##       ##
+ ##  #  ##  ##  ##       ##     ##       ##    ##     ## ## ## ## ## ## ## ######   ##
+ ## ### ##  ##  ##       ##     ##       ##    ##     ## ##  #### ##  #### ##       ##
+ ####  ###  ##  ##       ##     ##       ##    ##     ## ##   ### ##   ### ##       ##
+ ###   ## #### ######## ########        ##     #######  ##    ## ##    ## ######## ########
+BANNER
+    echo -e "            W I L D   T U N N E L   -   V 1${NC}"
+    echo
+}
+
+# run_steps step1 step2 ... : run an ordered list of input steps that support
+# step-by-step Back. A step returns 0 (advance), BACK_RC (go back one step) or
+# SKIP_RC (not applicable -> keep moving in the current direction). If the user
+# backs out before the first step, run_steps returns BACK_RC (caller shows menu).
+run_steps() {
+    local -a __steps=("$@")
+    local __i=0 __dir=1 __rc
+    while (( __i >= 0 && __i < ${#__steps[@]} )); do
+        "${__steps[__i]}"; __rc=$?
+        if   (( __rc == BACK_RC )); then __dir=-1; (( __i-- ))
+        elif (( __rc == SKIP_RC )); then (( __i += __dir ))
+        else __dir=1; (( __i++ )); fi
+    done
+    (( __i < 0 )) && return $BACK_RC
+    return 0
+}
+
+hint_back() { echo -e "${YELLOW}(enter 0 to go Back)${NC}"; }
 
 # ---------------------------------------------------------------------------
 # Prerequisites & helpers
@@ -268,26 +304,6 @@ WILDCMD
 generate_uuid() { uuidgen; }
 generate_password() { tr -dc A-Za-z0-9 </dev/urandom | head -c 16; }
 
-# Ask for the single port the tunnel itself listens on / dials.
-prompt_tunnel_port() {
-    while true; do
-        read -p "Enter Tunnel Port (1-65535): " TUNNEL_PORT
-        if [[ "$TUNNEL_PORT" =~ ^[0-9]+$ ]] && [ "$TUNNEL_PORT" -ge 1 ] && [ "$TUNNEL_PORT" -le 65535 ]; then
-            break
-        fi
-        echo -e "${RED}Invalid port. Enter a number between 1 and 65535.${NC}"
-    done
-}
-
-# Ask for the ports that should be forwarded through the tunnel (local side).
-prompt_forward_ports() {
-    while true; do
-        read -p "Enter ports to forward (comma separated, e.g., 2053,8443): " FORWARD_PORTS
-        [ -n "$FORWARD_PORTS" ] && break
-        echo -e "${RED}You must enter at least one port.${NC}"
-    done
-}
-
 # ---------------------------------------------------------------------------
 # Credential / cipher prompts
 # ---------------------------------------------------------------------------
@@ -304,10 +320,12 @@ prompt_ss_method() {
     echo "5) 2022-blake3-aes-256-gcm        (SS2022)"
     echo "6) 2022-blake3-aes-128-gcm        (SS2022)"
     echo "7) 2022-blake3-chacha20-poly1305  (SS2022)"
-    read -p "Cipher [1-7]: " ss_opt
+    echo "0) Back"
+    read -p "Cipher [1-7, 0=Back]: " ss_opt
 
     local keylen=""
     case $ss_opt in
+        0) return $BACK_RC;;
         1) SS_METHOD="aes-256-gcm";;
         2) SS_METHOD="aes-128-gcm";;
         3) SS_METHOD="chacha20-ietf-poly1305";;
@@ -331,6 +349,7 @@ prompt_ss_method() {
             echo "Generated Password: $PASSWORD"
         fi
     fi
+    return 0
 }
 
 prompt_vmess_security() {
@@ -340,8 +359,10 @@ prompt_vmess_security() {
     echo "3) chacha20-poly1305"
     echo "4) none"
     echo "5) zero"
-    read -p "Security [1-5]: " sec_opt
+    echo "0) Back"
+    read -p "Security [1-5, 0=Back]: " sec_opt
     case $sec_opt in
+        0) return $BACK_RC;;
         1) VMESS_SECURITY="auto";;
         2) VMESS_SECURITY="aes-128-gcm";;
         3) VMESS_SECURITY="chacha20-poly1305";;
@@ -349,6 +370,7 @@ prompt_vmess_security() {
         5) VMESS_SECURITY="zero";;
         *) VMESS_SECURITY="auto"; echo "Defaulting to auto";;
     esac
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -362,8 +384,10 @@ prompt_transmission() {
     echo "3) grpc"
     echo "4) http (HTTP/2)"
     echo "5) httpupgrade"
-    read -p "Transmission [1-5]: " net_opt
+    echo "0) Back"
+    read -p "Transmission [1-5, 0=Back]: " net_opt
     case $net_opt in
+        0) return $BACK_RC;;
         1) NETWORK="tcp";;
         2) NETWORK="ws";;
         3) NETWORK="grpc";;
@@ -385,6 +409,7 @@ prompt_transmission() {
             read -p "Host [optional, blank to skip]: " HTTP_HOST
             ;;
     esac
+    return 0
 }
 
 prompt_security_choice() {
@@ -392,8 +417,10 @@ prompt_security_choice() {
     echo "1) none"
     echo "2) tls"
     echo "3) reality"
-    read -p "Security [1-3]: " sopt
+    echo "0) Back"
+    read -p "Security [1-3, 0=Back]: " sopt
     case $sopt in
+        0) return $BACK_RC;;
         1) SECURITY="none";;
         2) SECURITY="tls";;
         3) SECURITY="reality";;
@@ -411,29 +438,39 @@ prompt_security_choice() {
     else
         FLOW=""
     fi
+    return 0
 }
 
 prompt_vless_encryption() {
-    read -p "Enable VLESS Encryption (post-quantum ML-KEM)? (y/n) [n]: " ve
+    read -p "Enable VLESS Encryption (post-quantum ML-KEM)? (y/n) [n] (0=Back): " ve
+    [ "$ve" = "0" ] && return $BACK_RC
     if [[ "$ve" == "y" || "$ve" == "Y" ]]; then
         VLESS_ENC="on"
         FLOW=""   # do not combine Vision flow with VLESS Encryption
     else
         VLESS_ENC="off"
     fi
+    return 0
 }
 
 # ---------------------------------------------------------------------------
 # Key generation (run on the REMOTE, needs the installed xray binary)
 # ---------------------------------------------------------------------------
 
-gen_reality_keys() {
+# Interactive part (asks for dest + SNI). Back-aware.
+prompt_reality_dest() {
     echo -e "${YELLOW}Tip: REALITY dest must use TLS1.3 with a SMALL cert (ECDSA). Good: dl.google.com, www.cloudflare.com. Avoid big RSA chains like www.microsoft.com.${NC}"
-    read -p "REALITY dest (camouflage site) [Default: dl.google.com:443]: " REALITY_DEST
+    read -p "REALITY dest (camouflage site) [Default: dl.google.com:443] (0=Back): " REALITY_DEST
+    [ "$REALITY_DEST" = "0" ] && return $BACK_RC
     REALITY_DEST=${REALITY_DEST:-dl.google.com:443}
-    read -p "REALITY serverName/SNI [Default: dl.google.com]: " REALITY_SNI
+    read -p "REALITY serverName/SNI [Default: dl.google.com] (0=Back): " REALITY_SNI
+    [ "$REALITY_SNI" = "0" ] && return $BACK_RC
     REALITY_SNI=${REALITY_SNI:-dl.google.com}
+    return 0
+}
 
+# Generation part (runs after install, needs the installed xray binary).
+make_reality_keys() {
     local out
     out=$("$CORE_DIR/xray" x25519) || die "xray x25519 failed"
     echo -e "${YELLOW}----- xray x25519 output (copy manually if parsing fails) -----${NC}"
@@ -566,73 +603,25 @@ is_stream_protocol() {
 }
 
 # ---------------------------------------------------------------------------
-# Protocol prompt
-# ---------------------------------------------------------------------------
-
-prompt_protocol_info() {
-    echo -e "${GREEN}Select Tunnel Protocol:${NC}"
-    echo "1) VLESS (TCP)"
-    echo "2) VMESS (TCP)"
-    echo "3) Trojan (TCP)"
-    echo "4) Shadowsocks (TCP/UDP, selectable cipher)"
-    echo "5) Socks (TCP/UDP)"
-    echo "6) Hysteria 2 (UDP, with Obfuscation)"
-    read -p "Protocol [1-6]: " proto_opt
-
-    case $proto_opt in
-        1) PROTOCOL="vless";;
-        2) PROTOCOL="vmess";;
-        3) PROTOCOL="trojan";;
-        4) PROTOCOL="shadowsocks";;
-        5) PROTOCOL="socks";;
-        6) PROTOCOL="hysteria2"; ENGINE="hysteria";;
-        *) PROTOCOL="vless"; echo "Defaulting to vless";;
-    esac
-
-    # Credentials
-    if [[ "$PROTOCOL" == "vless" || "$PROTOCOL" == "vmess" ]]; then
-        read -p "Enter UUID [Leave blank to auto-generate]: " UUID
-        if [ -z "$UUID" ]; then
-            UUID=$(generate_uuid)
-            echo "Generated UUID: $UUID"
-        fi
-        [[ "$PROTOCOL" == "vmess" ]] && prompt_vmess_security
-    elif [[ "$PROTOCOL" == "shadowsocks" ]]; then
-        prompt_ss_method
-    elif [[ "$PROTOCOL" == "trojan" || "$PROTOCOL" == "socks" || "$PROTOCOL" == "hysteria2" ]]; then
-        read -p "Enter Password [Leave blank to auto-generate]: " PASSWORD
-        if [ -z "$PASSWORD" ]; then
-            PASSWORD=$(generate_password)
-            echo "Generated Password: $PASSWORD"
-        fi
-        if [[ "$PROTOCOL" == "hysteria2" ]]; then
-            read -p "Enter Obfuscation Password [Leave blank to auto-generate]: " OBFS_PASS
-            if [ -z "$OBFS_PASS" ]; then
-                OBFS_PASS=$(generate_password)
-                echo "Generated Obfuscation Password: $OBFS_PASS"
-            fi
-        fi
-    fi
-
-    # Transmission + Security layer (VLESS/VMESS/Trojan only)
-    if is_stream_protocol; then
-        prompt_transmission
-        prompt_security_choice
-        [[ "$PROTOCOL" == "vless" ]] && prompt_vless_encryption
-    fi
-}
-
-# ---------------------------------------------------------------------------
 # Certificate generation (TLS)
 # ---------------------------------------------------------------------------
 
-generate_certs() {
+# Interactive part (asks for a real cert + domain). Back-aware.
+prompt_tls_domain() {
     echo -e "${GREEN}Do you want to get a REAL SSL certificate using Let's Encrypt? (y/n)${NC}"
     echo "Note: You must have a domain pointing to this server's IP, and port 80 must be free."
-    read -p "Choice: " USE_REAL_SSL
-
+    read -p "Choice (y/n) [n] (0=Back): " USE_REAL_SSL
+    [ "$USE_REAL_SSL" = "0" ] && return $BACK_RC
     if [[ "$USE_REAL_SSL" == "y" || "$USE_REAL_SSL" == "Y" ]]; then
-        read -p "Enter your Domain Name (e.g., sub.domain.com): " DOMAIN
+        read -p "Enter your Domain Name (e.g., sub.domain.com) (0=Back): " DOMAIN
+        [ "$DOMAIN" = "0" ] && return $BACK_RC
+    fi
+    return 0
+}
+
+# Generation part (runs after install, no prompts). Uses USE_REAL_SSL/DOMAIN.
+make_certs() {
+    if [[ "$USE_REAL_SSL" == "y" || "$USE_REAL_SSL" == "Y" ]]; then
         echo -e "${GREEN}Installing Certbot...${NC}"
         apt-get update -q && apt-get install -y certbot || die "Failed to install certbot"
         check_port 80
@@ -689,7 +678,7 @@ EOF
 
 create_remote_config() {
     if [[ "$ENGINE" == "hysteria" ]]; then
-        generate_certs
+        make_certs
         create_remote_hysteria
         return
     fi
@@ -697,9 +686,9 @@ create_remote_config() {
     # Security material for stream-capable protocols
     if is_stream_protocol; then
         if [[ "$SECURITY" == "tls" ]]; then
-            generate_certs
+            make_certs
         elif [[ "$SECURITY" == "reality" ]]; then
-            gen_reality_keys
+            make_reality_keys
         fi
         [[ "$PROTOCOL" == "vless" && "$VLESS_ENC" == "on" ]] && gen_vless_enc
     fi
@@ -775,42 +764,12 @@ EOF
 }
 
 create_local_config() {
-    prompt_forward_ports
-
+    # All interactive input (forward ports + client-side security material) has
+    # already been collected by the step-based flow before install; here we only
+    # write the configuration.
     if [[ "$ENGINE" == "hysteria" ]]; then
-        read -p "Does the Remote Server use a REAL Domain Name for TLS? (y/n): " HAS_REAL_DOMAIN
-        if [[ "$HAS_REAL_DOMAIN" == "y" || "$HAS_REAL_DOMAIN" == "Y" ]]; then
-            read -p "Enter the Domain Name: " LOCAL_SERVER_NAME
-            LOCAL_ALLOW_INSECURE="false"
-        else
-            LOCAL_SERVER_NAME="bing.com"
-            LOCAL_ALLOW_INSECURE="true"
-        fi
         create_local_hysteria
         return
-    fi
-
-    # Client-side security material (must match the remote's choices)
-    if is_stream_protocol; then
-        if [[ "$SECURITY" == "tls" ]]; then
-            read -p "Does the Remote Server use a REAL Domain Name for TLS? (y/n): " HAS_REAL_DOMAIN
-            if [[ "$HAS_REAL_DOMAIN" == "y" || "$HAS_REAL_DOMAIN" == "Y" ]]; then
-                read -p "Enter the Domain Name: " LOCAL_SERVER_NAME
-                LOCAL_ALLOW_INSECURE="false"
-            else
-                LOCAL_SERVER_NAME="bing.com"
-                LOCAL_ALLOW_INSECURE="true"
-            fi
-        elif [[ "$SECURITY" == "reality" ]]; then
-            read -p "Enter REALITY serverName/SNI (same as remote): " REALITY_SNI
-            read -p "Enter REALITY Public Key (from remote): " REALITY_PUBLIC
-            read -p "Enter REALITY shortId (from remote): " REALITY_SHORTID
-            read -p "Enter uTLS fingerprint [Default: chrome]: " REALITY_FINGERPRINT
-            REALITY_FINGERPRINT=${REALITY_FINGERPRINT:-chrome}
-        fi
-        if [[ "$PROTOCOL" == "vless" && "$VLESS_ENC" == "on" ]]; then
-            read -p "Enter VLESS Encryption string (from remote): " VLESS_ENCRYPTION
-        fi
     fi
 
     local settings stream
@@ -974,36 +933,222 @@ print_remote_summary() {
 }
 
 # ---------------------------------------------------------------------------
-# Main dispatch
+# Input steps (support step-by-step Back with "0")
 # ---------------------------------------------------------------------------
 
-if [ "$role_option" == "1" ]; then
-    ROLE="remote"
+# Reset all per-run selections so a previous run (or a backed-out run) never
+# leaks stale values into the next installation.
+reset_state() {
+    ENGINE="xray"; PROTOCOL=""; NETWORK="tcp"; SECURITY="none"; FLOW=""
+    VLESS_ENC="off"; VLESS_ENCRYPTION="none"; VLESS_DECRYPTION="none"
+    UUID=""; PASSWORD=""; OBFS_PASS=""; SS_METHOD=""; VMESS_SECURITY="auto"
+    WS_PATH="/"; HTTP_HOST=""; GRPC_SERVICE="grpc"; HTTP_PATH="/"
+    REALITY_DEST=""; REALITY_SNI=""; REALITY_PUBLIC=""; REALITY_PRIVATE=""
+    REALITY_SHORTID=""; REALITY_FINGERPRINT="chrome"
+    USE_REAL_SSL=""; DOMAIN=""; LOCAL_SERVER_NAME=""; LOCAL_ALLOW_INSECURE="true"
+    FORWARD_PORTS=""; REMOTE_IP=""; TUNNEL_PORT=""
+}
+
+step_tunnel_port() {
+    hint_back
+    while true; do
+        read -p "Enter Tunnel Port (1-65535): " TUNNEL_PORT
+        [ "$TUNNEL_PORT" = "0" ] && return $BACK_RC
+        if [[ "$TUNNEL_PORT" =~ ^[0-9]+$ ]] && [ "$TUNNEL_PORT" -ge 1 ] && [ "$TUNNEL_PORT" -le 65535 ]; then
+            break
+        fi
+        echo -e "${RED}Invalid port. Enter a number between 1 and 65535 (or 0 to go back).${NC}"
+    done
+    return 0
+}
+
+lstep_remote_ip() {
+    hint_back
+    while true; do
+        read -p "Enter Remote Server IP: " REMOTE_IP
+        [ "$REMOTE_IP" = "0" ] && return $BACK_RC
+        [ -n "$REMOTE_IP" ] && break
+        echo -e "${RED}Remote IP cannot be empty (or 0 to go back).${NC}"
+    done
+    return 0
+}
+
+sstep_protocol() {
+    echo -e "${GREEN}Select Tunnel Protocol:${NC}"
+    echo "1) VLESS (TCP)"
+    echo "2) VMESS (TCP)"
+    echo "3) Trojan (TCP)"
+    echo "4) Shadowsocks (TCP/UDP, selectable cipher)"
+    echo "5) Socks (TCP/UDP)"
+    echo "6) Hysteria 2 (UDP, with Obfuscation)"
+    echo "0) Back"
+    read -p "Protocol [1-6, 0=Back]: " proto_opt
+    case $proto_opt in
+        0) return $BACK_RC;;
+        1) PROTOCOL="vless"; ENGINE="xray";;
+        2) PROTOCOL="vmess"; ENGINE="xray";;
+        3) PROTOCOL="trojan"; ENGINE="xray";;
+        4) PROTOCOL="shadowsocks"; ENGINE="xray";;
+        5) PROTOCOL="socks"; ENGINE="xray";;
+        6) PROTOCOL="hysteria2"; ENGINE="hysteria";;
+        *) PROTOCOL="vless"; ENGINE="xray"; echo "Defaulting to vless";;
+    esac
+    return 0
+}
+
+sstep_creds() {
+    case "$PROTOCOL" in
+        vless|vmess)
+            read -p "Enter UUID [Leave blank to auto-generate] (0=Back): " UUID
+            [ "$UUID" = "0" ] && return $BACK_RC
+            [ -z "$UUID" ] && { UUID=$(generate_uuid); echo "Generated UUID: $UUID"; }
+            [[ "$PROTOCOL" == "vmess" ]] && { prompt_vmess_security || return $BACK_RC; }
+            ;;
+        shadowsocks)
+            prompt_ss_method || return $BACK_RC
+            ;;
+        trojan|socks|hysteria2)
+            read -p "Enter Password [Leave blank to auto-generate] (0=Back): " PASSWORD
+            [ "$PASSWORD" = "0" ] && return $BACK_RC
+            [ -z "$PASSWORD" ] && { PASSWORD=$(generate_password); echo "Generated Password: $PASSWORD"; }
+            if [[ "$PROTOCOL" == "hysteria2" ]]; then
+                read -p "Enter Obfuscation Password [Leave blank to auto-generate]: " OBFS_PASS
+                [ -z "$OBFS_PASS" ] && { OBFS_PASS=$(generate_password); echo "Generated Obfuscation Password: $OBFS_PASS"; }
+            fi
+            ;;
+    esac
+    return 0
+}
+
+sstep_transmission() {
+    is_stream_protocol || return $SKIP_RC
+    prompt_transmission
+}
+
+sstep_security() {
+    is_stream_protocol || return $SKIP_RC
+    prompt_security_choice
+}
+
+sstep_vlessenc() {
+    is_stream_protocol || return $SKIP_RC
+    [[ "$PROTOCOL" == "vless" ]] || return $SKIP_RC
+    prompt_vless_encryption
+}
+
+# Remote-side security material (dest/SNI for REALITY, or real-cert domain).
+rstep_secmaterial() {
+    if [[ "$ENGINE" == "hysteria" ]]; then
+        prompt_tls_domain; return $?
+    fi
+    is_stream_protocol || return $SKIP_RC
+    if [[ "$SECURITY" == "tls" ]]; then
+        prompt_tls_domain; return $?
+    elif [[ "$SECURITY" == "reality" ]]; then
+        prompt_reality_dest; return $?
+    fi
+    return $SKIP_RC
+}
+
+# Client-side domain (TLS) prompt used by the local side.
+prompt_remote_domain() {
+    read -p "Does the Remote Server use a REAL Domain Name for TLS? (y/n) (0=Back): " HAS_REAL_DOMAIN
+    [ "$HAS_REAL_DOMAIN" = "0" ] && return $BACK_RC
+    if [[ "$HAS_REAL_DOMAIN" == "y" || "$HAS_REAL_DOMAIN" == "Y" ]]; then
+        read -p "Enter the Domain Name (0=Back): " LOCAL_SERVER_NAME
+        [ "$LOCAL_SERVER_NAME" = "0" ] && return $BACK_RC
+        LOCAL_ALLOW_INSECURE="false"
+    else
+        LOCAL_SERVER_NAME="bing.com"
+        LOCAL_ALLOW_INSECURE="true"
+    fi
+    return 0
+}
+
+# Client-side REALITY material (must match the remote's output).
+prompt_client_reality() {
+    read -p "Enter REALITY serverName/SNI (same as remote) (0=Back): " REALITY_SNI
+    [ "$REALITY_SNI" = "0" ] && return $BACK_RC
+    read -p "Enter REALITY Public Key (from remote) (0=Back): " REALITY_PUBLIC
+    [ "$REALITY_PUBLIC" = "0" ] && return $BACK_RC
+    read -p "Enter REALITY shortId (from remote) (0=Back): " REALITY_SHORTID
+    [ "$REALITY_SHORTID" = "0" ] && return $BACK_RC
+    read -p "Enter uTLS fingerprint [Default: chrome]: " REALITY_FINGERPRINT
+    REALITY_FINGERPRINT=${REALITY_FINGERPRINT:-chrome}
+    return 0
+}
+
+# Local-side security material (TLS domain / REALITY material / VLESS enc str).
+lstep_client_material() {
+    if [[ "$ENGINE" == "hysteria" ]]; then
+        prompt_remote_domain; return $?
+    fi
+    is_stream_protocol || return $SKIP_RC
+    local any=0
+    if [[ "$SECURITY" == "tls" ]]; then
+        prompt_remote_domain || return $BACK_RC; any=1
+    elif [[ "$SECURITY" == "reality" ]]; then
+        prompt_client_reality || return $BACK_RC; any=1
+    fi
+    if [[ "$PROTOCOL" == "vless" && "$VLESS_ENC" == "on" ]]; then
+        read -p "Enter VLESS Encryption string (from remote) (0=Back): " VLESS_ENCRYPTION
+        [ "$VLESS_ENCRYPTION" = "0" ] && return $BACK_RC
+        any=1
+    fi
+    [ "$any" -eq 0 ] && return $SKIP_RC
+    return 0
+}
+
+lstep_forward_ports() {
+    hint_back
+    while true; do
+        read -p "Enter ports to forward (comma separated, e.g., 2053,8443): " FORWARD_PORTS
+        [ "$FORWARD_PORTS" = "0" ] && return $BACK_RC
+        [ -n "$FORWARD_PORTS" ] && break
+        echo -e "${RED}You must enter at least one port (or 0 to go back).${NC}"
+    done
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Top-level actions
+# ---------------------------------------------------------------------------
+
+do_remote_setup() {
+    ROLE="remote"; reset_state
     echo -e "${GREEN}--- Remote Server Setup ---${NC}"
     echo "This installer is self-contained and does not touch the Sanaei/3x-ui panel."
     ensure_prerequisites
-    prompt_tunnel_port
+    if ! run_steps step_tunnel_port sstep_protocol sstep_creds \
+                    sstep_transmission sstep_security sstep_vlessenc rstep_secmaterial; then
+        echo -e "${YELLOW}Setup cancelled - returning to main menu.${NC}"
+        return
+    fi
     check_port "$TUNNEL_PORT"
-    prompt_protocol_info
     install_core
     create_remote_config
     setup_service
     print_remote_summary
+}
 
-elif [ "$role_option" == "2" ]; then
-    ROLE="local"
+do_local_setup() {
+    ROLE="local"; reset_state
     echo -e "${GREEN}--- Local Server Setup ---${NC}"
     echo "This installer is self-contained and does not touch the Sanaei/3x-ui panel."
     ensure_prerequisites
-    read -p "Enter Remote Server IP: " REMOTE_IP
-    prompt_tunnel_port
-    prompt_protocol_info
+    if ! run_steps lstep_remote_ip step_tunnel_port sstep_protocol sstep_creds \
+                    sstep_transmission sstep_security sstep_vlessenc \
+                    lstep_client_material lstep_forward_ports; then
+        echo -e "${YELLOW}Setup cancelled - returning to main menu.${NC}"
+        return
+    fi
     install_core
     create_local_config
     setup_service
     [[ "$ENGINE" == "xray" ]] && setup_forward_service
+}
 
-elif [ "$role_option" == "3" ]; then
+do_uninstall() {
     echo -e "${RED}Uninstalling Wild Tunnel...${NC}"
     systemctl stop "$FWD_SERVICE" 2>/dev/null
     systemctl disable "$FWD_SERVICE" 2>/dev/null
@@ -1022,6 +1167,30 @@ elif [ "$role_option" == "3" ]; then
     systemctl reset-failed "$FWD_SERVICE" 2>/dev/null
     echo -e "${GREEN}Uninstallation complete.${NC}"
     echo "Note: the Sanaei/3x-ui panel (if installed) was not touched."
-else
-    echo -e "${RED}Invalid option selected.${NC}"
-fi
+}
+
+# ---------------------------------------------------------------------------
+# Main menu (loops until Exit)
+# ---------------------------------------------------------------------------
+
+main_menu() {
+    while true; do
+        show_banner
+        echo "1) Install Remote Server (Foreign - Receiver)"
+        echo "2) Install Local Server (Iran - Forwarder)"
+        echo "3) Uninstall Wild Tunnel"
+        echo "4) Exit"
+        read -p "Select an option [1-4]: " role_option
+        case "$role_option" in
+            1) do_remote_setup ;;
+            2) do_local_setup ;;
+            3) do_uninstall ;;
+            4) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
+            *) echo -e "${RED}Invalid option selected.${NC}" ;;
+        esac
+        echo
+        read -p "Press Enter to return to the main menu..." _
+    done
+}
+
+main_menu
