@@ -15,6 +15,8 @@
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
+CYAN='\033[1;36m'
+BOLD='\033[1m'
 NC='\033[0m' # No Color
 
 # Pinned core versions
@@ -71,20 +73,28 @@ die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
 BACK_RC=10   # a step returns this when the user pressed 0 (Back)
 SKIP_RC=20   # a step returns this when it does not apply in the current context
 
-# Big symbolic banner shown at the top of the main menu.
+# Big symbolic banner shown at the top of every menu.
 show_banner() {
     clear 2>/dev/null
-    echo -e "${GREEN}"
+    echo -e "${CYAN}"
     cat <<'BANNER'
- ##     ## #### ##       ########     ######## ##     ## ##    ## ##    ## ######## ##
- ##     ##  ##  ##       ##     ##       ##    ##     ## ###   ## ###   ## ##       ##
- ##     ##  ##  ##       ##     ##       ##    ##     ## ####  ## ####  ## ##       ##
- ##  #  ##  ##  ##       ##     ##       ##    ##     ## ## ## ## ## ## ## ######   ##
- ## ### ##  ##  ##       ##     ##       ##    ##     ## ##  #### ##  #### ##       ##
- ####  ###  ##  ##       ##     ##       ##    ##     ## ##   ### ##   ### ##       ##
- ###   ## #### ######## ########        ##     #######  ##    ## ##    ## ######## ########
+   ██╗    ██╗██╗██╗     ██████╗
+   ██║    ██║██║██║     ██╔══██╗
+   ██║ █╗ ██║██║██║     ██║  ██║
+   ██║███╗██║██║██║     ██║  ██║
+   ╚███╔███╔╝██║███████╗██████╔╝
+    ╚══╝╚══╝ ╚═╝╚══════╝╚═════╝
+   ████████╗██╗   ██╗███╗   ██╗███╗   ██╗███████╗██╗
+   ╚══██╔══╝██║   ██║████╗  ██║████╗  ██║██╔════╝██║
+      ██║   ██║   ██║██╔██╗ ██║██╔██╗ ██║█████╗  ██║
+      ██║   ██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║
+      ██║   ╚██████╔╝██║ ╚████║██║ ╚████║███████╗███████╗
+      ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
 BANNER
-    echo -e "            W I L D   T U N N E L   -   V 1${NC}"
+    echo -e "${NC}"
+    echo -e "${BOLD}${YELLOW}        «  W I L D   T U N N E L   ·   V 1  »${NC}"
+    echo -e "${GREEN}     GitHub: ${NC}${BOLD}https://github.com/infowild/Wild-Tunnel-V1${NC}"
+    echo -e "${CYAN}   ────────────────────────────────────────────────────────${NC}"
     echo
 }
 
@@ -1194,7 +1204,8 @@ do_remote_setup() {
     if ! run_steps step_tunnel_port sstep_protocol sstep_creds \
                     sstep_transmission sstep_security sstep_vlessenc rstep_secmaterial; then
         echo -e "${YELLOW}Setup cancelled - returning to main menu.${NC}"
-        return
+        pause_enter
+        return 1
     fi
     check_port "$TUNNEL_PORT"
     install_core
@@ -1202,6 +1213,10 @@ do_remote_setup() {
     setup_service
     save_state
     print_remote_summary
+    echo
+    echo -e "${YELLOW}Copy the details above to the Iran (local) server before continuing.${NC}"
+    pause_enter
+    return 0
 }
 
 do_local_setup() {
@@ -1213,13 +1228,17 @@ do_local_setup() {
                     sstep_transmission sstep_security sstep_vlessenc \
                     lstep_client_material lstep_forward_ports; then
         echo -e "${YELLOW}Setup cancelled - returning to main menu.${NC}"
-        return
+        pause_enter
+        return 1
     fi
     install_core
     create_local_config
     setup_service
     [[ "$ENGINE" == "xray" ]] && setup_forward_service
     save_state
+    echo -e "${GREEN}Local (Iran) tunnel installed.${NC}"
+    pause_enter
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1472,6 +1491,62 @@ do_uninstall() {
 }
 
 # ---------------------------------------------------------------------------
+# Post-install management menu (shown right after a successful install)
+# ---------------------------------------------------------------------------
+
+pause_enter() { echo; read -p "Press Enter to continue..." _; }
+
+has_forward() { [ -f /etc/systemd/system/${FWD_SERVICE}.service ]; }
+
+svc_status() {
+    systemctl status "$SERVICE" --no-pager | head -n 15
+    has_forward && { echo; systemctl status "$FWD_SERVICE" --no-pager | head -n 15; }
+}
+
+svc_logs() {
+    echo -e "${YELLOW}Showing live logs for $SERVICE. Press Ctrl+C to stop.${NC}"
+    journalctl -u "$SERVICE" -f
+}
+
+show_full_config() {
+    [ -f "$CONF_DIR/config.json" ] && { echo -e "${GREEN}--- config.json ---${NC}"; cat "$CONF_DIR/config.json"; echo; }
+    [ -f "$CONF_DIR/config.yaml" ] && { echo -e "${GREEN}--- config.yaml ---${NC}"; cat "$CONF_DIR/config.yaml"; echo; }
+    [ -f "$CONF_DIR/wild.conf" ]   && { echo -e "${GREEN}--- saved parameters (wild.conf) ---${NC}"; cat "$CONF_DIR/wild.conf"; }
+}
+
+post_install_menu() {
+    while true; do
+        show_banner
+        echo -e "${GREEN}Tunnel is installed. Management menu:${NC}"
+        echo "1) Status"
+        echo "2) Restart tunnel"
+        echo "3) Stop tunnel"
+        echo "4) Start tunnel"
+        echo "5) Live logs (Ctrl+C to exit)"
+        echo "6) Show config"
+        echo "7) Edit Configuration"
+        echo "8) Uninstall"
+        echo "9) Back to main menu"
+        echo "0) Exit"
+        read -p "Select an option [0-9]: " opt
+        case "$opt" in
+            1) svc_status ;;
+            2) systemctl restart "$SERVICE"; has_forward && systemctl restart "$FWD_SERVICE"; echo -e "${GREEN}Restarted.${NC}" ;;
+            3) systemctl stop "$SERVICE"; has_forward && systemctl stop "$FWD_SERVICE"; echo -e "${YELLOW}Stopped.${NC}" ;;
+            4) systemctl start "$SERVICE"; has_forward && systemctl start "$FWD_SERVICE"; echo -e "${GREEN}Started.${NC}" ;;
+            5) svc_logs ;;
+            6) show_full_config ;;
+            7) do_edit ;;
+            8) do_uninstall; pause_enter; return ;;
+            9) return ;;
+            0) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
+            *) echo -e "${RED}Invalid option.${NC}" ;;
+        esac
+        pause_enter
+    done
+}
+
+# ---------------------------------------------------------------------------
 # Main menu (loops until Exit)
 # ---------------------------------------------------------------------------
 
@@ -1481,19 +1556,19 @@ main_menu() {
         echo "1) Install Remote Server (Foreign - Receiver)"
         echo "2) Install Local Server (Iran - Forwarder)"
         echo "3) Edit Configuration"
-        echo "4) Uninstall Wild Tunnel"
-        echo "5) Exit"
-        read -p "Select an option [1-5]: " role_option
+        echo "4) Management menu (post-install)"
+        echo "5) Uninstall Wild Tunnel"
+        echo "6) Exit"
+        read -p "Select an option [1-6]: " role_option
         case "$role_option" in
-            1) do_remote_setup ;;
-            2) do_local_setup ;;
-            3) do_edit ;;
-            4) do_uninstall ;;
-            5) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
-            *) echo -e "${RED}Invalid option selected.${NC}" ;;
+            1) do_remote_setup && post_install_menu ;;
+            2) do_local_setup && post_install_menu ;;
+            3) do_edit; pause_enter ;;
+            4) post_install_menu ;;
+            5) do_uninstall; pause_enter ;;
+            6) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
+            *) echo -e "${RED}Invalid option selected.${NC}"; pause_enter ;;
         esac
-        echo
-        read -p "Press Enter to return to the main menu..." _
     done
 }
 
