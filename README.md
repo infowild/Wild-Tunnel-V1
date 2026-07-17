@@ -231,11 +231,19 @@ untouched.
 
 ## Security notes
 
-- `VLESS`, `VMESS`, and `SOCKS` are tunneled **without TLS** (`security: none`). They
-  are fast but more easily fingerprinted. For obfuscation-resistant setups prefer
-  **Trojan** (TLS) or **Hysteria2** (TLS + Salamander).
-- Self-signed certificates use `CN=bing.com` and the client sets `allowInsecure`.
-  Use a real domain + Let's Encrypt when you need genuine certificate validation.
+- Every Xray protocol (`VLESS`, `VMESS`, `Trojan`, `Shadowsocks`, `SOCKS`) can be
+  given a **Transmission** (tcp/ws/grpc/http/httpupgrade) and a **Security** layer
+  (`none`/`tls`/`reality`).
+- With `security: none` the tunnel is trivially fingerprinted. Under Iran's DPI the
+  connection is established and the upload passes, but the **first downstream data
+  packet is dropped** and the tunnel appears to hang. This is not a bug: adding
+  **REALITY** to the exact same protocol/port fixes it. Prefer **REALITY**.
+- `Shadowsocks` and `SOCKS` forward **TCP only** when tls/reality is enabled: their
+  UDP would bypass the transport unmasked (Xray does not apply streamSettings to
+  their native UDP path without XUDP).
+- Self-signed certificates use `CN=bing.com`. Xray v26 removed `allowInsecure`, so
+  the remote prints a **TLS cert SHA256 pin** that you enter on the local side
+  (`pinnedPeerCertSha256`). Use a real domain + Let's Encrypt to skip the pin.
 
 ---
 
@@ -477,11 +485,20 @@ journalctl -u wild-tunnel -f      # مشاهدهٔ زندهٔ لاگ‌ها
 
 ## نکات امنیتی
 
-- پروتکل‌های `VLESS`، `VMESS` و `SOCKS` **بدون TLS** تونل می‌شوند (`security: none`).
-  سریع هستند اما راحت‌تر شناسایی می‌شوند. برای مقاومت در برابر شناسایی، **Trojan** (با
-  TLS) یا **Hysteria2** (TLS + Salamander) را ترجیح دهید.
-- گواهی‌های self-signed از `CN=bing.com` استفاده می‌کنند و کلاینت `allowInsecure` را
-  فعال می‌کند. برای اعتبارسنجی واقعی گواهی، از دامنهٔ واقعی + Let's Encrypt استفاده کنید.
+- همهٔ پروتکل‌های Xray (`VLESS`، `VMESS`، `Trojan`، `Shadowsocks`، `SOCKS`) می‌توانند
+  لایهٔ **Transmission** (tcp/ws/grpc/http/httpupgrade) و **Security**
+  (`none`/`tls`/`reality`) بگیرند.
+- با `security: none` تونل به‌راحتی شناسایی می‌شود. زیر DPI ایران، اتصال برقرار
+  می‌شود و آپلود هم عبور می‌کند، اما **اولین بستهٔ دادهٔ برگشتی دراپ می‌شود** و تونل
+  انگار هنگ می‌کند. این باگ نیست: افزودن **REALITY** به همان پروتکل و همان پورت
+  مشکل را حل می‌کند. توصیه: از **REALITY** استفاده کنید.
+- `Shadowsocks` و `SOCKS` وقتی tls/reality فعال باشد فقط **TCP** را فوروارد می‌کنند؛
+  چون UDP آن‌ها بدون استتار از کنار لایهٔ ترنسپورت رد می‌شود (Xray بدون XUDP روی
+  مسیر UDP بومی این پروتکل‌ها streamSettings اعمال نمی‌کند).
+- گواهی‌های self-signed از `CN=bing.com` استفاده می‌کنند. Xray نسخهٔ ۲۶ فیلد
+  `allowInsecure` را حذف کرده، پس سرور خارج یک **هش SHA256 گواهی** چاپ می‌کند که
+  باید در سرور ایران وارد شود (`pinnedPeerCertSha256`). با دامنهٔ واقعی +
+  Let's Encrypt نیازی به این هش نیست.
 
 ---
 

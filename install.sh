@@ -360,6 +360,14 @@ WILDCMD
 generate_uuid() { uuidgen; }
 generate_password() { tr -dc A-Za-z0-9 </dev/urandom | head -c 16; }
 
+# SHA-256 fingerprint of a certificate, in the lowercase hex form Xray expects
+# for "pinnedPeerCertSha256". Xray v26 REMOVED "allowInsecure", so a self-signed
+# certificate can only be trusted by pinning this value on the client side.
+cert_sha256() {
+    openssl x509 -noout -fingerprint -sha256 -in "$1" 2>/dev/null \
+        | sed 's/.*=//; s/://g' | tr 'A-Z' 'a-z'
+}
+
 # ---------------------------------------------------------------------------
 # Credential / cipher prompts
 # ---------------------------------------------------------------------------
@@ -487,6 +495,12 @@ prompt_security_choice() {
         echo -e "${YELLOW}Note: '$NETWORK' transmission normally needs tls or reality; 'none' may fail to connect.${NC}"
     fi
 
+    if [[ "$SECURITY" == "none" ]]; then
+        echo -e "${YELLOW}Warning: without tls/reality the tunnel is fingerprintable; Iran's DPI drops its return traffic. REALITY is recommended.${NC}"
+    elif [[ "$PROTOCOL" == "shadowsocks" || "$PROTOCOL" == "socks" ]]; then
+        echo -e "${YELLOW}Note: with tls/reality, $PROTOCOL forwards TCP only (its UDP would bypass the camouflage unmasked).${NC}"
+    fi
+
     # XTLS Vision only applies to VLESS over raw TCP with a TLS-like security
     # layer, and is mutually exclusive with VLESS Encryption (set later).
     if [[ "$PROTOCOL" == "vless" && "$NETWORK" == "tcp" && ( "$SECURITY" == "tls" || "$SECURITY" == "reality" ) ]]; then
@@ -588,7 +602,12 @@ stream_json() {
             if [[ "$role" == "remote" ]]; then
                 parts+=("\"tlsSettings\": { \"certificates\": [ { \"certificateFile\": \"$CERT_FILE\", \"keyFile\": \"$KEY_FILE\" } ] }")
             else
-                parts+=("\"tlsSettings\": { \"serverName\": \"$LOCAL_SERVER_NAME\", \"allowInsecure\": $LOCAL_ALLOW_INSECURE }")
+                # A real (Let's Encrypt) certificate validates normally. A
+                # self-signed one must be pinned by fingerprint: Xray v26 removed
+                # "allowInsecure" and fails to start if it is present.
+                local tls_local="\"serverName\": \"$LOCAL_SERVER_NAME\""
+                [ -n "$LOCAL_PINNED_SHA" ] && tls_local="$tls_local, \"pinnedPeerCertSha256\": \"$LOCAL_PINNED_SHA\""
+                parts+=("\"tlsSettings\": { $tls_local }")
             fi
             ;;
         reality)
@@ -623,10 +642,17 @@ remote_settings() {
             echo "\"clients\": [ { \"password\": \"$PASSWORD\" } ]"
             ;;
         shadowsocks)
-            echo "\"method\": \"$SS_METHOD\", \"password\": \"$PASSWORD\", \"network\": \"tcp,udp\""
+            # Without XUDP, Shadowsocks/Socks UDP uses the protocol's native path
+            # and bypasses the configured transport + security layer, so it would
+            # travel unmasked and be dropped. Restrict to TCP when camouflaged.
+            local ss_net="tcp,udp"
+            [[ "$SECURITY" != "none" ]] && ss_net="tcp"
+            echo "\"method\": \"$SS_METHOD\", \"password\": \"$PASSWORD\", \"network\": \"$ss_net\""
             ;;
         socks)
-            echo "\"auth\": \"password\", \"accounts\": [ { \"user\": \"tunnel\", \"pass\": \"$PASSWORD\" } ], \"udp\": true"
+            local socks_udp="true"
+            [[ "$SECURITY" != "none" ]] && socks_udp="false"
+            echo "\"auth\": \"password\", \"accounts\": [ { \"user\": \"tunnel\", \"pass\": \"$PASSWORD\" } ], \"udp\": $socks_udp"
             ;;
     esac
 }
@@ -654,8 +680,14 @@ local_settings() {
     esac
 }
 
+# Protocols that can carry a transport (ws/grpc/...) and a security layer
+# (tls/reality). Shadowsocks and Socks are included: Xray supports streamSettings
+# for them over TCP, and without camouflage Iran's DPI drops the tunnel's return
+# traffic (proven 2026-07-17 with a two-sided capture). Both tunnel ends are
+# Xray, so compatibility with stock Shadowsocks clients does not matter here.
 is_stream_protocol() {
-    [[ "$PROTOCOL" == "vless" || "$PROTOCOL" == "vmess" || "$PROTOCOL" == "trojan" ]]
+    [[ "$PROTOCOL" == "vless" || "$PROTOCOL" == "vmess" || "$PROTOCOL" == "trojan" \
+       || "$PROTOCOL" == "shadowsocks" || "$PROTOCOL" == "socks" ]]
 }
 
 # ---------------------------------------------------------------------------
@@ -688,6 +720,7 @@ make_certs() {
         KEY_FILE="/etc/letsencrypt/live/$DOMAIN/privkey.pem"
         SERVER_NAME="$DOMAIN"
         ALLOW_INSECURE="false"
+        CERT_SHA256=""   # a real certificate validates normally; no pin needed
 
         # Reload the tunnel after every automatic certificate renewal.
         mkdir -p /etc/letsencrypt/renewal-hooks/deploy
@@ -697,15 +730,23 @@ systemctl restart wild-tunnel
 HOOK
         chmod +x /etc/letsencrypt/renewal-hooks/deploy/wild-tunnel.sh
     else
-        echo -e "${GREEN}Generating self-signed certificates...${NC}"
-        openssl ecparam -genkey -name prime256v1 -out "$CONF_DIR/private.key" \
-            || die "Failed to generate private key"
-        openssl req -new -x509 -days 3650 -key "$CONF_DIR/private.key" -out "$CONF_DIR/cert.crt" -subj "/CN=bing.com" >/dev/null 2>&1 \
-            || die "Failed to generate self-signed certificate"
         CERT_FILE="$CONF_DIR/cert.crt"
         KEY_FILE="$CONF_DIR/private.key"
         SERVER_NAME="bing.com"
         ALLOW_INSECURE="true"
+        # Keep an existing certificate: regenerating it would change the SHA-256
+        # pin and silently break the already-configured local (Iran) side.
+        if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
+            echo -e "${GREEN}Reusing the existing self-signed certificate (keeps its pin stable).${NC}"
+        else
+            echo -e "${GREEN}Generating self-signed certificates...${NC}"
+            openssl ecparam -genkey -name prime256v1 -out "$KEY_FILE" \
+                || die "Failed to generate private key"
+            openssl req -new -x509 -days 3650 -key "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=$SERVER_NAME" >/dev/null 2>&1 \
+                || die "Failed to generate self-signed certificate"
+        fi
+        CERT_SHA256=$(cert_sha256 "$CERT_FILE")
+        [ -n "$CERT_SHA256" ] || die "Could not compute the certificate SHA-256 fingerprint"
     fi
 }
 
@@ -990,7 +1031,14 @@ print_remote_summary() {
         echo "REALITY Public Key: $REALITY_PUBLIC"
         echo "REALITY shortId: $REALITY_SHORTID"
     }
-    [[ "$SECURITY" == "tls" && "$ALLOW_INSECURE" == "false" ]] && echo "Domain/SNI: $SERVER_NAME"
+    if [[ "$SECURITY" == "tls" ]]; then
+        if [[ "$ALLOW_INSECURE" == "false" ]]; then
+            echo "Domain/SNI: $SERVER_NAME"
+        else
+            echo "TLS SNI: $SERVER_NAME"
+            echo "TLS cert SHA256 pin: $CERT_SHA256"
+        fi
+    fi
     [[ "$VLESS_ENC" == "on" ]] && echo "VLESS Encryption: $VLESS_ENCRYPTION"
 }
 
@@ -1008,6 +1056,8 @@ reset_state() {
     REALITY_DEST=""; REALITY_SNI=""; REALITY_PUBLIC=""; REALITY_PRIVATE=""
     REALITY_SHORTID=""; REALITY_FINGERPRINT="chrome"
     USE_REAL_SSL=""; DOMAIN=""; LOCAL_SERVER_NAME=""; LOCAL_ALLOW_INSECURE="true"
+    CERT_FILE=""; KEY_FILE=""; SERVER_NAME=""; ALLOW_INSECURE=""
+    CERT_SHA256=""; LOCAL_PINNED_SHA=""
     FORWARD_PORTS=""; REMOTE_IP=""; TUNNEL_PORT=""
 }
 
@@ -1048,8 +1098,10 @@ CERT_FILE="$CERT_FILE"
 KEY_FILE="$KEY_FILE"
 SERVER_NAME="$SERVER_NAME"
 ALLOW_INSECURE="$ALLOW_INSECURE"
+CERT_SHA256="$CERT_SHA256"
 LOCAL_SERVER_NAME="$LOCAL_SERVER_NAME"
 LOCAL_ALLOW_INSECURE="$LOCAL_ALLOW_INSECURE"
+LOCAL_PINNED_SHA="$LOCAL_PINNED_SHA"
 FORWARD_PORTS="$FORWARD_PORTS"
 EOF
     chmod 600 "$CONF_DIR/wild.conf" 2>/dev/null || true
@@ -1173,9 +1225,16 @@ prompt_remote_domain() {
         read -p "Enter the Domain Name (0=Back): " LOCAL_SERVER_NAME
         [ "$LOCAL_SERVER_NAME" = "0" ] && return $BACK_RC
         LOCAL_ALLOW_INSECURE="false"
+        LOCAL_PINNED_SHA=""
     else
         LOCAL_SERVER_NAME="bing.com"
         LOCAL_ALLOW_INSECURE="true"
+        # Hysteria trusts a self-signed cert via its own "insecure" flag; Xray
+        # needs the fingerprint the remote printed in its summary.
+        if [[ "$ENGINE" != "hysteria" ]]; then
+            read -p "Enter TLS cert SHA256 pin (from the remote summary) (0=Back): " LOCAL_PINNED_SHA
+            [ "$LOCAL_PINNED_SHA" = "0" ] && return $BACK_RC
+        fi
     fi
     return 0
 }
@@ -1368,9 +1427,14 @@ edit_remote_domain_local() {
     [ "$ans" = "0" ] && return 1
     if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
         edit_field LOCAL_SERVER_NAME "Domain Name" || return 1
-        LOCAL_ALLOW_INSECURE="false"
+        LOCAL_ALLOW_INSECURE="false"; LOCAL_PINNED_SHA=""
     elif [[ "$ans" == "n" || "$ans" == "N" ]]; then
         LOCAL_SERVER_NAME="bing.com"; LOCAL_ALLOW_INSECURE="true"
+    fi
+    # Self-signed remotes are trusted by fingerprint (Xray v26 has no
+    # allowInsecure); let it be corrected whenever the remote's cert changes.
+    if [[ "$LOCAL_ALLOW_INSECURE" == "true" && "$ENGINE" != "hysteria" ]]; then
+        edit_field LOCAL_PINNED_SHA "TLS cert SHA256 pin (from remote)" || return 1
     fi
     return 0
 }
