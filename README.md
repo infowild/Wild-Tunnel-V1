@@ -24,15 +24,15 @@ TCP and UDP are relayed on the selected ports, except when Shadowsocks or SOCKS 
  └──────────────┘                            └──────────────┘
    listens on                                  terminates the tunnel and
    your chosen ports                           connects to 127.0.0.1:<port>
-   (TUN/tun2socks or native forwarding)           on its own side
+   (direct Xray listeners; TUN fallback)            on its own side
 ```
 
 - **Remote server (Receiver):** terminates the tunnel and forwards traffic to
   `127.0.0.1:<port>` on itself (via Xray `freedom` outbound, or Hysteria2's built-in
   proxy). This is where your panel/service actually listens.
-- **Local server (Forwarder):** opens the chosen ports and pushes incoming traffic into the tunnel. Hysteria2 uses native `tcpForwarding` / `udpForwarding`. Xray uses scoped iptables rules, a dedicated TUN device, and the pinned `tun2socks` helper feeding a loopback-only SOCKS inbound.
+- **Local server (Forwarder):** Xray listens directly on every forwarded port with a dedicated `dokodemo-door` inbound and sends the stream into one dispatcher. This default path has no TUN, NAT, or tun2socks hop. Xray locations are direct outbounds; every Hysteria2 location runs as a separate loopback-only SOCKS client and is selected by the same dispatcher. The previous TUN pipeline remains available as the `tun-legacy` compatibility mode.
 
-The tunnel core runs as `wild-tunnel`. A local Xray forwarder also runs `wild-forward` to manage the TUN device and scoped firewall rules. Both systemd units are generated at install time and hardened with private temporary storage, a read-only system filesystem, and a restrictive umask.
+The tunnel core and direct listeners run as `wild-tunnel`. Only `tun-legacy` mode also runs `wild-forward` to manage tun2socks, the TUN device, and scoped firewall rules. The systemd units are generated at install time and hardened with private temporary storage, a read-only system filesystem, and a restrictive umask.
 
 ---
 
@@ -51,7 +51,7 @@ all prerequisites it needs (`unzip`, `jq`, `openssl`, `uuid-runtime`, `wget`,
 **No conflict with the Sanaei / 3x-ui panel.** Everything is namespaced
 (`wild-tunnel` service, `/usr/local/bin/wild-xray`, `/etc/wild-tunnel`, `wild`
 command), so it never touches the panel's `x-ui` service, `/usr/local/x-ui`,
-`/etc/x-ui` or `/usr/bin/x-ui`. It does not modify the panel's files or services. A selected listen port can still clash with another process, and a local Xray installation necessarily adds narrowly scoped iptables rules while it runs; existing sysctl values are saved and restored when that forwarder stops or is removed.
+`/etc/x-ui` or `/usr/bin/x-ui`. It does not modify the panel's files or services. A forwarded port in direct mode must be free for Xray to bind. The optional `tun-legacy` mode adds narrowly scoped iptables rules while it runs; existing sysctl values are saved and restored when that forwarder stops or is removed.
 
 ---
 
@@ -92,7 +92,7 @@ You will be asked to choose a role:
 
 Choose option **1**, then:
 
-1. Enter the **Tunnel Port** (default `50000`).
+1. Enter one or more **Tunnel Ports**, for example `443,2053,8443`. Inclusive ranges are also accepted; Hysteria2 uses them for native port hopping, while Xray expands at most 64 ports into separate listeners.
 2. Pick a **protocol** (1–6).
 3. Provide/auto-generate the credentials (UUID or password, plus obfuscation
    password for Hysteria2).
@@ -105,13 +105,23 @@ obfuscation password, SNI). **Save them** — you need them for the local server
 
 Choose option **2**, then:
 
-1. Enter the **Remote Server IP**.
-2. Enter the **same Tunnel Port** and **same protocol/credentials** as the remote.
-3. Enter the **ports to tunnel** (comma-separated, e.g. `2053,8443`).
+1. Give the first location a name and enter its **Remote Server IP**.
+2. Enter the **same tunnel port(s)** and **same protocol/credentials** as that remote.
+3. Enter the **ports to forward** locally (comma-separated, e.g. `2053,8443`). These forwarded service ports are global, independent of the tunnel transport ports, and must be free on the local server in the default direct mode.
 4. For TLS/Hysteria2, enter the remote domain or the SHA-256 certificate pin printed by the remote installer. Self-signed connections are never accepted without a pin.
+5. Answer **yes** to “Add another remote location?” to mix additional Xray or Hysteria2 locations in the same installation.
 
 Once finished, connecting to `LOCAL_IP:<port>` reaches `127.0.0.1:<port>` on the
 remote server through the tunnel.
+
+### Multi-location and multi-port
+
+- A location is one remote endpoint plus its protocol, credentials, security, and tunnel-port list. Locations may freely mix Xray protocols and Hysteria2.
+- Each Xray tunnel port becomes an independent outbound path. Hysteria2 accepts comma lists/ranges as native port hopping and each Hysteria location gets its own managed client instance.
+- The default `leastLoad` strategy uses Xray health observations and keeps a fallback path. `leastPing`, `roundRobin`, and `random` are also available under `wild` → **Edit configuration** → **Manage Locations / Load Balancing**.
+- TCP and UDP use separate eligible-path pools, so a TCP-only location is never selected for UDP.
+- New installations use `direct` forwarding: Xray binds the service ports itself and bypasses the userspace TUN stack. `tun-legacy` can be selected from the edit menu if direct binding is incompatible with another local service.
+- Existing single-location local installations are migrated automatically to `/etc/wild-tunnel/locations.json` the first time the new edit/apply path is used.
 
 ---
 
@@ -165,9 +175,11 @@ Guardrails: `xtls-rprx-vision` flow is only applied to VLESS over `tcp` with `tl
 
 ### Upload performance tuning
 
-On a local Xray forwarder, tun2socks uses a 4 MB receive window with TCP receive auto-tuning, while the TUN transmit queue is enlarged to absorb upload bursts. If the kernel exposes BBR, Xray selects it only for the outbound tunnel socket; the host-wide congestion-control default is not changed. This improves high-latency/lossy upload at the cost of additional RAM per active connection.
+The default direct forwarder removes the shared `iptables → TUN → tun2socks → SOCKS` ingress path and hands each accepted stream directly to Xray. This reduces userspace TCP processing, copies, and context switches—especially important on a 1-vCPU server. If the kernel exposes BBR, Xray selects it only for the outbound tunnel socket; the host-wide congestion-control default is not changed.
 
-The local Hysteria client uses its BBR `aggressive` profile for upload and leaves explicit bandwidth limits unset. You can switch it to `standard` or `conservative` from `wild` → Edit configuration → option 11 if aggressive mode performs worse on a lossy route.
+The optional `tun-legacy` fallback retains the previous 4 MB tun2socks receive window, TCP receive auto-tuning, and enlarged TUN transmit queue.
+
+Each local Hysteria client uses its BBR `aggressive` profile for upload and leaves explicit bandwidth limits unset. Reconfigure that location from `wild` → Edit configuration → Manage Locations if `standard` or `conservative` performs better on a lossy route.
 
 `SOCKS` is unencrypted, and `Hysteria2` (separate core) relies on TLS + Salamander
 obfuscation.
@@ -200,18 +212,23 @@ It opens a management menu:
 
 Option **7** edits the saved installation and regenerates a validated configuration. Option **8** installs a tagged `crontab` restart schedule; option **9** removes only that tagged entry.
 
+To move an installation created before v2 onto the faster path, run the latest installer once, then open `wild` → **Edit configuration** → **Forwarding Mode**, select `direct`, and Apply. Legacy installations intentionally remain on `tun-legacy` until this explicit switch.
+
 Or use systemd directly:
 
 ```bash
 systemctl status wild-tunnel      # check status
 systemctl restart wild-tunnel     # restart
 journalctl -u wild-tunnel -f      # follow logs
+systemctl status 'wild-hysteria-client@*'  # Hysteria location clients
 ```
 
 Configuration lives in `/etc/wild-tunnel/`:
 
 - Xray protocols → `config.json`
-- Hysteria2 → `config.yaml`
+- Remote Hysteria2 receiver → `config.yaml`
+- Local location database → `locations.json`
+- Per-location Hysteria2 clients → `locations/loc-N.yaml`
 - Editable installation state → `wild.conf`
 
 These files are written atomically with mode `0600`. JSON is parsed by `jq` and semantically tested by Xray before service restart; Hysteria YAML is parsed with PyYAML.
@@ -281,15 +298,15 @@ Released under the [MIT License](LICENSE).
  └──────────────┘                            └──────────────┘
    روی پورت‌های                                 تونل را می‌بندد و به
    انتخابی شما گوش می‌دهد                        127.0.0.1:<port> سمت
-   (TUN/tun2socks or native forwarding)           خودش وصل می‌شود
+   (listener مستقیم Xray؛ TUN به‌عنوان fallback)   خودش وصل می‌شود
 ```
 
 - **سرور خارج (گیرنده):** تونل را دریافت می‌کند و ترافیک را به `127.0.0.1:<port>` روی
   خودش می‌فرستد (از طریق outbound نوع `freedom` در Xray یا پروکسی داخلی Hysteria2).
   پنل/سرویس واقعی شما این‌جا گوش می‌دهد.
-- **سرور محلی (فورواردر):** پورت‌های انتخابی را باز می‌کند. Hysteria2 از `tcpForwarding` / `udpForwarding` بومی استفاده می‌کند؛ Xray با قوانین محدود iptables، یک رابط TUN اختصاصی و باینری pinشدهٔ `tun2socks`، ترافیک را به inbound محلی SOCKS می‌رساند.
+- **سرور محلی (فورواردر):** Xray با inbound نوع `dokodemo-door` مستقیماً روی هر Forward Port گوش می‌دهد و جریان را وارد dispatcher مرکزی می‌کند؛ در مسیر پیش‌فرض دیگر TUN، NAT یا tun2socks وجود ندارد. locationهای Xray مستقیماً outbound هستند و برای هر location از نوع Hysteria2 یک کلاینت مستقل با SOCKS فقط روی loopback اجرا می‌شود. مسیر قبلی با نام `tun-legacy` برای سازگاری و rollback باقی مانده است.
 
-هستهٔ تونل با یونیت `wild-tunnel` اجرا می‌شود. در سرور محلی Xray، یونیت دوم `wild-forward` نیز TUN و قوانین محدود فایروال را مدیریت می‌کند. هر دو یونیت هنگام نصب تولید و با filesystem سیستمی read-only، فضای موقت خصوصی و umask محدود سخت‌سازی می‌شوند.
+هستهٔ تونل و listenerهای مستقیم با یونیت `wild-tunnel` اجرا می‌شوند. فقط در حالت `tun-legacy` یونیت دوم `wild-forward`، tun2socks، رابط TUN و قوانین محدود فایروال را مدیریت می‌کند. یونیت‌ها هنگام نصب تولید و با filesystem سیستمی read-only، فضای موقت خصوصی و umask محدود سخت‌سازی می‌شوند.
 
 ---
 
@@ -306,7 +323,7 @@ Released under the [MIT License](LICENSE).
 
 **بدون تداخل با پنل سنایی / 3x-ui.** همه‌چیز در namespace جدا است (سرویس
 `wild-tunnel`، مسیر `/usr/local/bin/wild-xray`، کانفیگ `/etc/wild-tunnel`، دستور
-`wild`)، پس به سرویس `x-ui` پنل و مسیرهای `/usr/local/x-ui`، `/etc/x-ui` و `/usr/bin/x-ui` دست نمی‌زند. بااین‌حال پورت انتخابی ممکن است با برنامه‌ای دیگر تداخل داشته باشد. همچنین سرور محلی Xray هنگام اجرا قوانین کاملاً محدود iptables می‌افزاید؛ مقادیر قبلی sysctl ذخیره و هنگام توقف/حذف فورواردر بازیابی می‌شوند.
+`wild`)، پس به سرویس `x-ui` پنل و مسیرهای `/usr/local/x-ui`، `/etc/x-ui` و `/usr/bin/x-ui` دست نمی‌زند. بااین‌حال Forward Port در حالت مستقیم باید برای bind شدن Xray آزاد باشد. حالت اختیاری `tun-legacy` هنگام اجرا قوانین کاملاً محدود iptables می‌افزاید؛ مقادیر قبلی sysctl ذخیره و هنگام توقف/حذف فورواردر بازیابی می‌شوند.
 
 ---
 
@@ -347,7 +364,7 @@ sudo ./install.sh
 
 گزینهٔ **۱** را انتخاب کنید، سپس:
 
-1. **پورت تونل** را وارد کنید (پیش‌فرض `50000`).
+1. یک یا چند **پورت تونل** وارد کنید؛ مثلاً `443,2053,8443`. بازهٔ شامل دو سر نیز پذیرفته می‌شود: Hysteria2 از آن برای port hopping بومی استفاده می‌کند و Xray حداکثر ۶۴ پورت را به listenerهای جدا گسترش می‌دهد.
 2. یک **پروتکل** انتخاب کنید (۱ تا ۶).
 3. اطلاعات ورود را وارد یا به‌صورت خودکار بسازید (UUID یا پسورد، و برای Hysteria2
    پسورد اوبفوسکیشن).
@@ -360,13 +377,23 @@ sudo ./install.sh
 
 گزینهٔ **۲** را انتخاب کنید، سپس:
 
-1. **IP سرور خارج** را وارد کنید.
-2. **همان پورت تونل** و **همان پروتکل/اطلاعات ورود** سرور خارج را وارد کنید.
-3. **پورت‌هایی که می‌خواهید تونل شوند** را وارد کنید (با کاما جدا شوند، مثلاً `2053,8443`).
+1. برای location اول یک نام انتخاب و **IP سرور خارج** را وارد کنید.
+2. **همان پورت یا پورت‌های تونل** و **همان پروتکل/اطلاعات ورود** آن سرور خارج را وارد کنید.
+3. **پورت‌های سرویس که باید فوروارد شوند** را وارد کنید (با کاما، مثلاً `2053,8443`). این پورت‌ها سراسری‌اند، با پورت انتقال تونل تفاوت دارند و در حالت مستقیم پیش‌فرض باید روی سرور ایران آزاد باشند.
 4. برای TLS/Hysteria2، دامنهٔ واقعی یا pin گواهی SHA-256 چاپ‌شده روی سرور خارج را وارد کنید. اتصال self-signed بدون pin پذیرفته نمی‌شود.
+5. برای افزودن سرورهای دیگر به سؤال **Add another remote location?** پاسخ `y` بدهید؛ Xray و Hysteria2 را می‌توان در یک نصب با هم ترکیب کرد.
 
 پس از پایان، اتصال به `LOCAL_IP:<port>` از طریق تونل به `127.0.0.1:<port>` روی سرور خارج
 می‌رسد.
+
+### مولتی‌لوکیشن و مولتی‌پورت
+
+- هر location شامل endpoint خارج، پروتکل، اطلاعات ورود، امنیت و فهرست پورت‌های تونل خودش است؛ locationها می‌توانند ترکیبی از پروتکل‌های Xray و Hysteria2 باشند.
+- هر پورت Xray یک مسیر outbound مستقل می‌شود. Hysteria2 فهرست/بازهٔ پورت را به‌صورت port hopping بومی استفاده می‌کند و برای هر location آن یک کلاینت systemd جدا ساخته می‌شود.
+- استراتژی پیش‌فرض `leastLoad` با health observation خود Xray مسیر سالم‌تر را انتخاب و fallback نگه می‌دارد. گزینه‌های `leastPing`، `roundRobin` و `random` نیز از مسیر `wild` → **Edit configuration** → **Manage Locations / Load Balancing** در دسترس‌اند.
+- pool مسیرهای TCP و UDP جداست؛ در نتیجه location فقط-TCP هیچ‌وقت برای UDP انتخاب نمی‌شود.
+- نصب جدید به‌صورت پیش‌فرض از forwarding حالت `direct` استفاده می‌کند: خود Xray پورت‌های سرویس را bind می‌کند و پشتهٔ TUN کاربرانpace حذف می‌شود. اگر bind مستقیم با سرویس محلی دیگری ناسازگار بود، `tun-legacy` از منوی Edit قابل انتخاب است.
+- نصب‌های تک‌لوکیشن قدیمی در اولین Edit/Apply به‌صورت خودکار به `/etc/wild-tunnel/locations.json` مهاجرت می‌کنند.
 
 ---
 
@@ -418,9 +445,11 @@ sudo ./install.sh
 
 ### بهینه‌سازی سرعت آپلود
 
-در فورواردر محلی Xray، بافر دریافت tun2socks روی ۴ مگابایت همراه TCP auto-tuning تنظیم شده و صف ارسال TUN برای جذب burstهای آپلود بزرگ‌تر است. اگر کرنل BBR داشته باشد، Xray آن را فقط برای socket خروجی تونل انتخاب می‌کند و congestion control سراسری سیستم تغییر نمی‌کند. این تنظیم در مسیرهای پرتاخیر یا packet-loss معمولاً آپلود را بهتر می‌کند، اما برای هر اتصال فعال RAM بیشتری مصرف می‌شود.
+فورواردر مستقیم پیش‌فرض مسیر مشترک `iptables → TUN → tun2socks → SOCKS` را حذف می‌کند و هر stream پذیرفته‌شده را مستقیم به Xray می‌دهد. در نتیجه پردازش TCP در userspace، کپی داده و context switch کمتر می‌شود؛ این موضوع به‌خصوص روی سرور ۱ vCPU مهم است. اگر کرنل BBR داشته باشد، Xray آن را فقط برای socket خروجی تونل انتخاب می‌کند و congestion control سراسری سیستم تغییر نمی‌کند.
 
-کلاینت محلی Hysteria از پروفایل BBR حالت `aggressive` استفاده می‌کند و bandwidth limit صریح ندارد. اگر روی مسیر بسیار ناپایدار نتیجه بدتر شد، از `wild` → Edit configuration → گزینهٔ ۱۱ آن را روی `standard` یا `conservative` بگذارید.
+حالت fallback یعنی `tun-legacy` همان receive window چهارمگابایتی tun2socks، TCP auto-tuning و صف بزرگ‌تر TUN را نگه می‌دارد.
+
+هر کلاینت محلی Hysteria از پروفایل BBR حالت `aggressive` استفاده می‌کند و bandwidth limit صریح ندارد. اگر روی مسیر بسیار ناپایدار نتیجه بدتر شد، آن location را از `wild` → Edit configuration → Manage Locations بازپیکربندی و پروفایل را روی `standard` یا `conservative` بگذارید.
 
 پروتکل `SOCKS` بدون رمزنگاری است و `Hysteria2` (هستهٔ جدا) به TLS + اوبفوسکیشن Salamander
 متکی است.
@@ -453,18 +482,23 @@ wild
 
 گزینهٔ **۷** تنظیمات ذخیره‌شده را ویرایش و کانفیگ معتبر را دوباره تولید می‌کند. گزینهٔ **۸** زمان‌بندی برچسب‌دار cron را می‌سازد و گزینهٔ **۹** فقط همان ورودی را حذف می‌کند.
 
+برای انتقال نصب ساخته‌شده با نسخهٔ قدیمی به مسیر سریع‌تر، اسکریپت جدید را یک‌بار اجرا کنید و سپس از `wild` → **Edit configuration** → **Forwarding Mode** حالت `direct` را انتخاب و Apply کنید. نصب قدیمی برای جلوگیری از تغییر ناگهانی تا این انتخاب صریح روی `tun-legacy` می‌ماند.
+
 یا مستقیم از systemd استفاده کنید:
 
 ```bash
 systemctl status wild-tunnel      # بررسی وضعیت
 systemctl restart wild-tunnel     # ری‌استارت
 journalctl -u wild-tunnel -f      # مشاهدهٔ زندهٔ لاگ‌ها
+systemctl status 'wild-hysteria-client@*'  # کلاینت‌های locationهای Hysteria
 ```
 
 پیکربندی در مسیر `/etc/wild-tunnel/` قرار دارد:
 
 - پروتکل‌های Xray → فایل `config.json`
-- Hysteria2 → فایل `config.yaml`
+- گیرندهٔ Hysteria2 در سرور خارج → فایل `config.yaml`
+- دیتابیس locationهای محلی → فایل `locations.json`
+- کلاینت‌های Hysteria2 هر location → فایل‌های `locations/loc-N.yaml`
 - وضعیت قابل‌ویرایش نصب → فایل `wild.conf`
 
 این فایل‌ها به‌صورت atomic و با mode برابر `0600` نوشته می‌شوند. JSON با `jq` parse و پیش از restart به‌صورت معنایی توسط Xray تست می‌شود؛ YAML نیز با PyYAML parse می‌شود.

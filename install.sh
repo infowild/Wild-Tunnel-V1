@@ -39,6 +39,11 @@ SERVICE="wild-tunnel"
 FWD_SERVICE="wild-forward"
 CRON_TAG="# wild-tunnel-restart"
 BBR_MODULE_FILE="/etc/modules-load.d/wild-tunnel-bbr.conf"
+LOCATIONS_FILE="$CONF_DIR/locations.json"
+LOCATIONS_DIR="$CONF_DIR/locations"
+HYSTERIA_CLIENT_SERVICE="wild-hysteria-client"
+HYSTERIA_CLIENT_LIST="$CONF_DIR/hysteria-clients.list"
+HYSTERIA_CLIENT_PREVIOUS="$CONF_DIR/hysteria-clients.previous"
 
 # Local port-forwarding (Xray engine) settings
 SOCKS_PORT="10808"            # local-only SOCKS inbound that tun2socks feeds
@@ -50,6 +55,7 @@ TUN_MTU="1500"               # explicit netstack MTU
 TUN_TXQLEN="10000"          # absorb upload bursts before userspace drains the TUN
 TUN_TCP_RCVBUF="4m"          # tun2socks upload-side receive window
 HYSTERIA_BBR_PROFILE="aggressive" # local/client upload congestion profile
+HYSTERIA_SOCKS_BASE="12080"       # loopback SOCKS ports for multi-location Hysteria clients
 
 # Runtime state
 ENGINE="xray"                 # xray | hysteria
@@ -58,6 +64,12 @@ SS_METHOD="aes-256-gcm"       # Shadowsocks cipher
 VMESS_SECURITY="auto"         # VMESS encryption
 SECURITY="none"               # none | tls | reality  (vless/vmess/trojan)
 NETWORK="tcp"                 # tcp | ws | grpc | http | httpupgrade
+TUNNEL_PORTS=""               # comma-separated ports; Hysteria also accepts ranges
+MULTI_MODE="off"              # local: one dispatcher with multiple remote locations
+BALANCER_STRATEGY="leastLoad" # random | roundRobin | leastPing | leastLoad
+LOCATION_NAME=""
+MULTI_UDP_ENABLED="false"
+FORWARD_MODE="direct"         # direct | tun-legacy
 VLESS_ENC="off"               # on | off (VLESS post-quantum Encryption)
 FLOW=""                       # xtls-rprx-vision when applicable
 # Transport sub-settings
@@ -179,6 +191,71 @@ check_port() {
     fi
 }
 
+# Validate a comma-separated tunnel-port specification. Individual ports and
+# inclusive ranges are accepted (for example: 443,2053,10000-10100). Xray
+# expands ranges into separate inbounds/outbounds; Hysteria consumes the same
+# string natively as its port-hopping address.
+normalize_port_spec() {
+    local spec token first last normalized="" total=0
+    local -a tokens=()
+    spec=$(printf '%s' "$1" | tr -d '[:space:]')
+    [ -n "$spec" ] || return 1
+    IFS=',' read -ra tokens <<< "$spec"
+    for token in "${tokens[@]}"; do
+        if [[ "$token" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            first=$((10#${BASH_REMATCH[1]})); last=$((10#${BASH_REMATCH[2]}))
+            (( first >= 1 && last <= 65535 && first <= last )) || return 1
+            total=$((total + last - first + 1))
+            token="$first-$last"
+        elif [[ "$token" =~ ^[0-9]+$ ]]; then
+            first=$((10#$token))
+            (( first >= 1 && first <= 65535 )) || return 1
+            total=$((total + 1)); token="$first"
+        else
+            return 1
+        fi
+        normalized="${normalized:+$normalized,}$token"
+    done
+    (( total > 0 )) || return 1
+    printf '%s\n' "$normalized"
+}
+
+first_tunnel_port() {
+    local token="${1%%,*}"
+    token="${token%%-*}"
+    printf '%s\n' "$token"
+}
+
+expand_tunnel_ports() {
+    local spec token first last p count=0 max_ports="${2:-64}"
+    local -a tokens=()
+    spec=$(normalize_port_spec "$1") || return 1
+    IFS=',' read -ra tokens <<< "$spec"
+    for token in "${tokens[@]}"; do
+        if [[ "$token" == *-* ]]; then
+            first=${token%-*}; last=${token#*-}
+            for ((p=first; p<=last; p++)); do
+                (( ++count <= max_ports )) || return 2
+                printf '%s\n' "$p"
+            done
+        else
+            (( ++count <= max_ports )) || return 2
+            printf '%s\n' "$token"
+        fi
+    done
+}
+
+validate_engine_port_spec() {
+    local engine="$1" spec="$2"
+    normalize_port_spec "$spec" >/dev/null || return 1
+    if [[ "$engine" == "xray" ]]; then
+        expand_tunnel_ports "$spec" 64 >/dev/null || {
+            echo -e "${RED}Xray supports at most 64 expanded tunnel ports per location.${NC}" >&2
+            return 1
+        }
+    fi
+}
+
 install_xray() {
     echo -e "${GREEN}Installing Xray core (${XRAY_VERSION})...${NC}"
     local archive extract_dir
@@ -242,10 +319,121 @@ ensure_core() {
     fi
 }
 
+ensure_multi_cores() {
+    mkdir -p "$CORE_DIR" "$CONF_DIR"
+    [ -x "$CORE_DIR/xray" ] || install_xray
+    if [ -f "$LOCATIONS_FILE" ] && jq -e '.nodes[] | select(.engine == "hysteria")' "$LOCATIONS_FILE" >/dev/null; then
+        [ -x "$CORE_DIR/hysteria" ] || install_hysteria
+    fi
+}
+
+stop_hysteria_clients() {
+    local id
+    [ -f "$HYSTERIA_CLIENT_LIST" ] || return 0
+    while read -r id; do
+        [ -n "$id" ] && systemctl stop "${HYSTERIA_CLIENT_SERVICE}@${id}.service" 2>/dev/null || true
+    done < "$HYSTERIA_CLIENT_LIST"
+}
+
+start_hysteria_clients() {
+    local id
+    [ -f "$HYSTERIA_CLIENT_LIST" ] || return 0
+    while read -r id; do
+        [ -n "$id" ] && systemctl start "${HYSTERIA_CLIENT_SERVICE}@${id}.service" || true
+    done < "$HYSTERIA_CLIENT_LIST"
+}
+
+restart_hysteria_clients() {
+    local id
+    [ -f "$HYSTERIA_CLIENT_LIST" ] || return 0
+    while read -r id; do
+        [ -n "$id" ] || continue
+        systemctl restart "${HYSTERIA_CLIENT_SERVICE}@${id}.service" \
+            && systemctl is-active --quiet "${HYSTERIA_CLIENT_SERVICE}@${id}.service" || return 1
+    done < "$HYSTERIA_CLIENT_LIST"
+}
+
+remove_hysteria_clients() {
+    local id
+    if [ -f "$HYSTERIA_CLIENT_LIST" ]; then
+        while read -r id; do
+            [ -n "$id" ] || continue
+            systemctl stop "${HYSTERIA_CLIENT_SERVICE}@${id}.service" 2>/dev/null || true
+            systemctl disable "${HYSTERIA_CLIENT_SERVICE}@${id}.service" 2>/dev/null || true
+        done < "$HYSTERIA_CLIENT_LIST"
+    fi
+    rm -f -- "/etc/systemd/system/${HYSTERIA_CLIENT_SERVICE}@.service" \
+        "$HYSTERIA_CLIENT_LIST" "$HYSTERIA_CLIENT_PREVIOUS"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+setup_hysteria_clients() {
+    local id unit_tmp any=false
+    [ -f "$HYSTERIA_CLIENT_LIST" ] || return 0
+    if [ -f "$HYSTERIA_CLIENT_PREVIOUS" ]; then
+        while read -r id; do
+            [ -n "$id" ] || continue
+            if ! grep -Fqx -- "$id" "$HYSTERIA_CLIENT_LIST"; then
+                systemctl stop "${HYSTERIA_CLIENT_SERVICE}@${id}.service" 2>/dev/null || true
+                systemctl disable "${HYSTERIA_CLIENT_SERVICE}@${id}.service" 2>/dev/null || true
+            fi
+        done < "$HYSTERIA_CLIENT_PREVIOUS"
+    fi
+    while read -r id; do [ -n "$id" ] && any=true; done < "$HYSTERIA_CLIENT_LIST"
+    if [ "$any" != true ]; then
+        rm -f -- "/etc/systemd/system/${HYSTERIA_CLIENT_SERVICE}@.service"
+        rm -f -- "$HYSTERIA_CLIENT_PREVIOUS"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        return 0
+    fi
+    unit_tmp=$(mktemp) || die "Could not create Hysteria client systemd unit"
+    cat <<EOF > "$unit_tmp"
+[Unit]
+Description=Wild Tunnel Hysteria Client (%i)
+Documentation=https://github.com/infowild/Wild-Tunnel-V1
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=root
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=$CONF_DIR
+UMask=0077
+ExecStart=$CORE_DIR/hysteria client -c $LOCATIONS_DIR/%i.yaml
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    install -m 0644 "$unit_tmp" "/etc/systemd/system/${HYSTERIA_CLIENT_SERVICE}@.service" || {
+        rm -f -- "$unit_tmp"; die "Could not install Hysteria client unit"
+    }
+    rm -f -- "$unit_tmp"
+    systemctl daemon-reload || die "systemd daemon-reload failed"
+    while read -r id; do
+        [ -n "$id" ] || continue
+        systemctl enable "${HYSTERIA_CLIENT_SERVICE}@${id}.service" >/dev/null \
+            || die "Could not enable Hysteria client $id"
+        if ! systemctl restart "${HYSTERIA_CLIENT_SERVICE}@${id}.service" \
+           || ! systemctl is-active --quiet "${HYSTERIA_CLIENT_SERVICE}@${id}.service"; then
+            journalctl -u "${HYSTERIA_CLIENT_SERVICE}@${id}.service" -n 30 --no-pager >&2
+            die "Hysteria client $id failed to start"
+        fi
+    done < "$HYSTERIA_CLIENT_LIST"
+    rm -f -- "$HYSTERIA_CLIENT_PREVIOUS"
+}
+
 setup_service() {
     echo -e "${GREEN}Setting up Systemd service...${NC}"
     local exec_cmd unit_tmp
-    if [[ "$ENGINE" == "hysteria" ]]; then
+    if [[ "$ROLE" == "local" && "$MULTI_MODE" == "on" ]]; then
+        exec_cmd="$CORE_DIR/xray run -config $CONF_DIR/config.json"
+    elif [[ "$ENGINE" == "hysteria" ]]; then
         if [[ "$ROLE" == "remote" ]]; then
             exec_cmd="$CORE_DIR/hysteria server -c $CONF_DIR/config.yaml"
         else
@@ -342,8 +530,10 @@ install_shortcut() {
         XRAY_VERSION HYSTERIA_VERSION TUN2SOCKS_VERSION
         XRAY_SHA256 HYSTERIA_SHA256 TUN2SOCKS_SHA256
         CORE_DIR CONF_DIR SERVICE FWD_SERVICE CRON_TAG BBR_MODULE_FILE
+        LOCATIONS_FILE LOCATIONS_DIR HYSTERIA_CLIENT_SERVICE HYSTERIA_CLIENT_LIST HYSTERIA_CLIENT_PREVIOUS
         SOCKS_PORT TUN_NAME TUN_ADDR TUN_CIDR SENTINEL_IP
-        TUN_MTU TUN_TXQLEN TUN_TCP_RCVBUF HYSTERIA_BBR_PROFILE
+        TUN_MTU TUN_TXQLEN TUN_TCP_RCVBUF HYSTERIA_BBR_PROFILE HYSTERIA_SOCKS_BASE
+        TUNNEL_PORTS MULTI_MODE BALANCER_STRATEGY LOCATION_NAME MULTI_UDP_ENABLED FORWARD_MODE
         BACK_RC SKIP_RC
     )
     mkdir -p "$manager_dir"
@@ -875,7 +1065,7 @@ install_private_config() {
 create_remote_hysteria() {
     local output="$1"
     cat <<EOF > "$output"
-listen: $(yaml_quote ":$TUNNEL_PORT")
+listen: $(yaml_quote ":${TUNNEL_PORTS:-$TUNNEL_PORT}")
 
 tls:
   cert: $(yaml_quote "$CERT_FILE")
@@ -889,13 +1079,26 @@ obfs:
   type: salamander
   salamander:
     password: $(yaml_quote "$OBFS_PASS")
+
+acl:
+  file: $(yaml_quote "$CONF_DIR/hysteria.acl")
 EOF
 }
 
 create_remote_config() {
-    local tmp settings stream
+    local tmp settings stream inbounds="" comma="" p acl_tmp
+    TUNNEL_PORTS="${TUNNEL_PORTS:-$TUNNEL_PORT}"
+    validate_engine_port_spec "$ENGINE" "$TUNNEL_PORTS" || die "Invalid tunnel port specification"
+    TUNNEL_PORT=$(first_tunnel_port "$TUNNEL_PORTS")
     if [[ "$ENGINE" == "hysteria" ]]; then
         make_certs
+        acl_tmp=$(mktemp "$CONF_DIR/.hysteria-acl.XXXXXX") || die "Could not create Hysteria ACL"
+        printf 'direct(%s, *, 127.0.0.1)\ndirect(all)\n' "$SENTINEL_IP" > "$acl_tmp"
+        install -m 0600 "$acl_tmp" "$CONF_DIR/hysteria.acl" || {
+            rm -f -- "$acl_tmp"
+            die "Could not install Hysteria ACL"
+        }
+        rm -f -- "$acl_tmp"
         tmp=$(mktemp "$CONF_DIR/.config.XXXXXX.yaml") || die "Could not create a temporary config"
         create_remote_hysteria "$tmp"
         validate_yaml_file "$tmp" || { rm -f -- "$tmp"; die "Generated Hysteria YAML is invalid"; }
@@ -922,21 +1125,39 @@ create_remote_config() {
         stream='"network": "tcp", "security": "none"'
     fi
 
+    while read -r p; do
+        check_port "$p"
+        inbounds+="$comma"$'\n'"    {
+      \"tag\": \"tunnel-in-$p\",
+      \"port\": $p,
+      \"listen\": \"0.0.0.0\",
+      \"protocol\": \"$PROTOCOL\",
+      \"settings\": { $settings },
+      \"streamSettings\": { $stream },
+      \"sniffing\": { \"enabled\": false }
+    }"
+        comma=","
+    done < <(expand_tunnel_ports "$TUNNEL_PORTS" 64) || die "Could not expand Xray tunnel ports"
+
     tmp=$(mktemp "$CONF_DIR/.config.XXXXXX.json") || die "Could not create a temporary config"
     cat <<EOF > "$tmp"
 {
   "log": { "loglevel": "warning" },
-  "inbounds": [
-    {
-      "port": $TUNNEL_PORT,
-      "listen": "0.0.0.0",
-      "protocol": "$PROTOCOL",
-      "settings": { $settings },
-      "streamSettings": { $stream },
-      "sniffing": { "enabled": false }
-    }
+  "inbounds": [ $inbounds ],
+  "outbounds": [
+    { "tag": "loopback", "protocol": "freedom", "settings": { "redirect": "127.0.0.1:0" } },
+    { "tag": "health-direct", "protocol": "freedom", "settings": {} }
   ],
-  "outbounds": [ { "protocol": "freedom", "settings": { "redirect": "127.0.0.1:0" } } ]
+  "routing": {
+    "domainStrategy": "AsIs",
+    "rules": [
+      {
+        "type": "field",
+        "domain": [ "full:connectivitycheck.gstatic.com" ],
+        "outboundTag": "health-direct"
+      }
+    ]
+  }
 }
 EOF
     jq -e . "$tmp" >/dev/null || { rm -f -- "$tmp"; die "Generated Xray JSON is invalid"; }
@@ -1007,8 +1228,222 @@ EOF
     done
 }
 
+create_location_hysteria_client() {
+    local output="$1" socks_port="$2"
+    local sni="${LOCAL_SERVER_NAME:-bing.com}" insecure="${LOCAL_ALLOW_INSECURE:-true}"
+    local pin_line="" hopping=""
+    [ -n "$LOCAL_PINNED_SHA" ] && pin_line="  pinSHA256: $(yaml_quote "$LOCAL_PINNED_SHA")"
+    if [[ "$TUNNEL_PORTS" == *,* || "$TUNNEL_PORTS" == *-* ]]; then
+        hopping=$'\ntransport:\n  type: udp\n  udp:\n    minHopInterval: 15s\n    maxHopInterval: 45s'
+    fi
+    cat <<EOF > "$output"
+server: $(yaml_quote "$REMOTE_IP:$TUNNEL_PORTS")
+auth: $(yaml_quote "$PASSWORD")
+tls:
+  sni: $(yaml_quote "$sni")
+  insecure: $insecure
+$pin_line
+obfs:
+  type: salamander
+  salamander:
+    password: $(yaml_quote "$OBFS_PASS")
+congestion:
+  type: bbr
+  bbrProfile: $(yaml_quote "${HYSTERIA_BBR_PROFILE:-aggressive}")
+socks5:
+  listen: $(yaml_quote "127.0.0.1:$socks_port")
+  disableUDP: false
+$hopping
+EOF
+}
+
+location_supports_udp() {
+    [[ "$ENGINE" == "hysteria" ]] && return 0
+    [[ "$PROTOCOL" == "shadowsocks" || "$PROTOCOL" == "socks" ]] && [[ "$SECURITY" != "none" ]] && return 1
+    return 0
+}
+
+build_multi_inbounds() {
+    local output="$1" port network="tcp" tag
+    local -a forward_ports=()
+    : > "$output"
+    if [[ "$FORWARD_MODE" == "tun-legacy" ]]; then
+        jq -nc --argjson port "$SOCKS_PORT" --argjson udp "$MULTI_UDP_ENABLED" '
+          {
+            tag:"socks-in", listen:"127.0.0.1", port:$port, protocol:"socks",
+            settings:{auth:"noauth", udp:$udp}, sniffing:{enabled:false}
+          }' > "$output"
+        return
+    fi
+    [[ "$FORWARD_MODE" == "direct" ]] || die "Invalid forwarding mode: $FORWARD_MODE"
+    [ "$MULTI_UDP_ENABLED" = true ] && network="tcp,udp"
+    IFS=',' read -ra forward_ports <<< "$FORWARD_PORTS"
+    for port in "${forward_ports[@]}"; do
+        port=$(printf '%s' "$port" | tr -d '[:space:]')
+        [ -n "$port" ] || continue
+        [[ "$port" =~ ^[0-9]+$ ]] || die "Invalid forward port: $port"
+        port=$((10#$port))
+        (( port >= 1 && port <= 65535 )) || die "Invalid forward port: $port"
+        check_port "$port"
+        tag="forward-in-$port"
+        jq -nc --arg tag "$tag" --arg address "$SENTINEL_IP" \
+            --arg network "$network" --argjson port "$port" '
+          {
+            tag:$tag, listen:"0.0.0.0", port:$port, protocol:"dokodemo-door",
+            settings:{address:$address, port:$port, network:$network, followRedirect:false},
+            sniffing:{enabled:false}
+          }' >> "$output"
+    done
+    [ -s "$output" ] || die "No valid forward ports provided"
+}
+
+create_multi_local_config() {
+    local tmp build locations_build old_locations="" previous_list out_file in_file tcp_file udp_file hy_list_file count i p tag settings stream
+    local socks_port inbounds outbounds tcp_selectors udp_selectors tcp_fallback udp_fallback udp_count strategy
+    ensure_locations_from_legacy
+    strategy=$(jq -r '.strategy // "leastLoad"' "$LOCATIONS_FILE")
+    [[ "$strategy" == "random" || "$strategy" == "roundRobin" || "$strategy" == "leastPing" || "$strategy" == "leastLoad" ]] \
+        || die "Invalid load-balancing strategy"
+    BALANCER_STRATEGY="$strategy"
+    build=$(mktemp -d "$CONF_DIR/.multi.XXXXXX") || die "Could not create multi-location build directory"
+    out_file="$build/outbounds.jsonl"; in_file="$build/inbounds.jsonl"
+    tcp_file="$build/tcp.tags"; udp_file="$build/udp.tags"
+    hy_list_file="$build/hysteria.list"; previous_list="$build/hysteria.previous"
+    locations_build="$build/locations"
+    : > "$out_file"; : > "$tcp_file"; : > "$udp_file"; : > "$hy_list_file"
+    mkdir -m 0700 "$locations_build"
+
+    count=$(location_count)
+    (( count > 0 )) || { rm -rf -- "$build"; die "No locations configured"; }
+    MULTI_UDP_ENABLED="false"
+    for ((i=0; i<count; i++)); do
+        load_location_globals "$i" || { rm -rf -- "$build"; die "Could not load location $i"; }
+        validate_engine_port_spec "$ENGINE" "$TUNNEL_PORTS" || { rm -rf -- "$build"; die "Invalid ports for $LOCATION_NAME"; }
+        if [[ "$ENGINE" == "hysteria" ]]; then
+            socks_port=$((HYSTERIA_SOCKS_BASE + i))
+            tag="wild-node-${i}-hysteria-out"
+            create_location_hysteria_client "$locations_build/loc-$i.yaml" "$socks_port"
+            validate_yaml_file "$locations_build/loc-$i.yaml" || { rm -rf -- "$build"; die "Invalid Hysteria client config for $LOCATION_NAME"; }
+            chmod 600 "$locations_build/loc-$i.yaml"
+            printf 'loc-%s\n' "$i" >> "$hy_list_file"
+            jq -nc --arg tag "$tag" --argjson port "$socks_port" \
+                '{tag:$tag, protocol:"socks", settings:{servers:[{address:"127.0.0.1",port:$port}]}}' >> "$out_file"
+            printf '%s\n' "$tag" >> "$tcp_file"
+            printf '%s\n' "$tag" >> "$udp_file"
+            MULTI_UDP_ENABLED="true"
+        else
+            while read -r p; do
+                TUNNEL_PORT="$p"
+                tag="wild-node-${i}-p${p}-out"
+                settings=$(local_settings); stream=$(stream_json local)
+                jq -nc --arg tag "$tag" --arg protocol "$PROTOCOL" \
+                    --argjson settings "{$settings}" --argjson stream "{$stream}" \
+                    '{tag:$tag, protocol:$protocol, settings:$settings, streamSettings:$stream}' >> "$out_file"
+                printf '%s\n' "$tag" >> "$tcp_file"
+                if location_supports_udp; then
+                    printf '%s\n' "$tag" >> "$udp_file"
+                    MULTI_UDP_ENABLED="true"
+                fi
+            done < <(expand_tunnel_ports "$TUNNEL_PORTS" 64)
+        fi
+    done
+
+    outbounds=$(jq -s '.' "$out_file")
+    build_multi_inbounds "$in_file"
+    inbounds=$(jq -s '.' "$in_file")
+    tcp_selectors=$(jq -R -s 'split("\n") | map(select(length > 0))' "$tcp_file")
+    udp_selectors=$(jq -R -s 'split("\n") | map(select(length > 0))' "$udp_file")
+    tcp_fallback=$(sed -n '1p' "$tcp_file")
+    udp_fallback=$(sed -n '1p' "$udp_file")
+    udp_count=$(jq 'length' <<< "$udp_selectors")
+    [ -n "$tcp_fallback" ] || { rm -rf -- "$build"; die "No TCP-capable location configured"; }
+
+    tmp=$(mktemp "$CONF_DIR/.config.XXXXXX.json") || { rm -rf -- "$build"; die "Could not create Xray config"; }
+    jq -n \
+      --argjson inbounds "$inbounds" --argjson outbounds "$outbounds" --argjson tcpSelectors "$tcp_selectors" \
+      --argjson udpSelectors "$udp_selectors" --arg tcpFallback "$tcp_fallback" \
+      --arg udpFallback "$udp_fallback" --arg strategy "$strategy" \
+      --argjson udpCount "$udp_count" '
+      {
+        log: {loglevel:"warning"},
+        inbounds:$inbounds,
+        outbounds:$outbounds,
+        routing:{
+          domainStrategy:"AsIs",
+          rules: ([{type:"field", network:"tcp", balancerTag:"wild-tcp"}] +
+                  (if $udpCount > 0 then [{type:"field", network:"udp", balancerTag:"wild-udp"}] else [] end)),
+          balancers: ([{
+            tag:"wild-tcp", selector:$tcpSelectors, fallbackTag:$tcpFallback,
+            strategy:{type:$strategy}
+          }] + (if $udpCount > 0 then [{
+            tag:"wild-udp", selector:$udpSelectors, fallbackTag:$udpFallback,
+            strategy:{type:$strategy}
+          }] else [] end))
+        },
+        burstObservatory:{
+          subjectSelector:["wild-node-"],
+          pingConfig:{
+            destination:"https://connectivitycheck.gstatic.com/generate_204",
+            connectivity:"", interval:"1m", sampling:5, timeout:"5s", httpMethod:"HEAD"
+          }
+        }
+      }' > "$tmp" || { rm -rf -- "$build"; rm -f -- "$tmp"; die "Could not generate multi-location config"; }
+
+    jq -e . "$tmp" >/dev/null || { rm -rf -- "$build"; rm -f -- "$tmp"; die "Generated Xray JSON is invalid"; }
+    "$CORE_DIR/xray" run -test -config "$tmp" >/dev/null 2>&1 || {
+        "$CORE_DIR/xray" run -test -config "$tmp" >&2
+        rm -rf -- "$build"; rm -f -- "$tmp"
+        die "Xray rejected the multi-location configuration"
+    }
+    install_private_config "$tmp" "$CONF_DIR/config.json" "$CONF_DIR/config.yaml"
+
+    # Keep the currently active client list until every new config has passed
+    # validation. setup_hysteria_clients uses it to disable removed instances.
+    if [ -f "$HYSTERIA_CLIENT_LIST" ]; then
+        install -m 0600 "$HYSTERIA_CLIENT_LIST" "$previous_list" || {
+            rm -rf -- "$build"; die "Could not preserve the previous Hysteria client list"
+        }
+    else
+        : > "$previous_list"
+        chmod 600 "$previous_list"
+    fi
+
+    # Swap the per-location directory only after all Xray and YAML validation
+    # succeeds, so a malformed edit never destroys the last working clients.
+    if [ -d "$LOCATIONS_DIR" ]; then
+        old_locations=$(mktemp -d "$CONF_DIR/.locations.previous.XXXXXX") \
+            || { rm -rf -- "$build"; die "Could not stage the previous location configs"; }
+        rmdir "$old_locations" || { rm -rf -- "$build" "$old_locations"; die "Could not stage location configs"; }
+        mv "$LOCATIONS_DIR" "$old_locations" || { rm -rf -- "$build"; die "Could not preserve previous location configs"; }
+    fi
+    if ! mv "$locations_build" "$LOCATIONS_DIR"; then
+        [ -n "$old_locations" ] && mv "$old_locations" "$LOCATIONS_DIR" 2>/dev/null || true
+        rm -rf -- "$build"
+        die "Could not activate new location configs"
+    fi
+    [ -n "$old_locations" ] && rm -rf -- "$old_locations"
+
+    install -m 0600 "$previous_list" "$HYSTERIA_CLIENT_PREVIOUS" || {
+        rm -rf -- "$build"; die "Could not install the previous Hysteria client list"
+    }
+    install -m 0600 "$hy_list_file" "$HYSTERIA_CLIENT_LIST" || {
+        rm -rf -- "$build"; die "Could not install Hysteria client list"
+    }
+    rm -rf -- "$build"
+    if [[ "$FORWARD_MODE" == "tun-legacy" ]]; then
+        install_tun2socks
+        write_forward_scripts
+    fi
+}
+
 create_local_config() {
     local tmp settings stream local_udp=true
+
+    if [[ "$ROLE" == "local" && "$MULTI_MODE" == "on" ]]; then
+        configure_xray_bbr
+        create_multi_local_config
+        return
+    fi
 
     if [[ "$ENGINE" == "xray" ]]; then
         configure_xray_bbr
@@ -1074,8 +1509,8 @@ EOF
     write_forward_scripts
 }
 
-# Generate the up/down scripts that build the TUN device + iptables rules so the
-# chosen ports are forwarded through the tunnel (system-level, no dokodemo-door).
+# Generate the compatibility-mode TUN device and iptables scripts. New direct
+# installations use dokodemo-door inbounds and never call this function.
 write_forward_scripts() {
     local ports_line="" udp_enabled=true
     IFS=',' read -ra PORT_ARRAY <<< "$FORWARD_PORTS"
@@ -1088,7 +1523,9 @@ write_forward_scripts() {
     done
     ports_line="${ports_line# }"
     [ -n "$ports_line" ] || die "No valid forward ports provided"
-    if [[ "$SECURITY" != "none" && ( "$PROTOCOL" == "shadowsocks" || "$PROTOCOL" == "socks" ) ]]; then
+    if [[ "$MULTI_MODE" == "on" ]]; then
+        udp_enabled="$MULTI_UDP_ENABLED"
+    elif [[ "$SECURITY" != "none" && ( "$PROTOCOL" == "shadowsocks" || "$PROTOCOL" == "socks" ) ]]; then
         udp_enabled=false
     fi
 
@@ -1233,9 +1670,22 @@ EOF
     systemctl status "$FWD_SERVICE" --no-pager | head -n 10
 }
 
+prepare_local_forwarding() {
+    case "$FORWARD_MODE" in
+        direct) remove_forward_service ;;
+        tun-legacy) stop_forward_runtime ;;
+        *) die "Invalid forwarding mode: $FORWARD_MODE" ;;
+    esac
+}
+
+finish_local_forwarding() {
+    [[ "$FORWARD_MODE" == "tun-legacy" ]] && setup_forward_service
+    return 0
+}
+
 print_remote_summary() {
     echo -e "${GREEN}Save these details for the Local Server setup:${NC}"
-    echo "Tunnel Port: $TUNNEL_PORT"
+    echo "Tunnel Port(s): ${TUNNEL_PORTS:-$TUNNEL_PORT}"
     echo "Protocol: $PROTOCOL"
     [[ -n "$UUID" ]] && echo "UUID: $UUID"
     [[ -n "$PASSWORD" ]] && echo "Password: $PASSWORD"
@@ -1290,7 +1740,10 @@ reset_state() {
     USE_REAL_SSL=""; DOMAIN=""; LOCAL_SERVER_NAME=""; LOCAL_ALLOW_INSECURE="true"
     CERT_FILE=""; KEY_FILE=""; SERVER_NAME=""; ALLOW_INSECURE=""
     CERT_SHA256=""; LOCAL_PINNED_SHA=""
-    FORWARD_PORTS=""; REMOTE_IP=""; TUNNEL_PORT=""; HYSTERIA_BBR_PROFILE="aggressive"
+    FORWARD_PORTS=""; REMOTE_IP=""; TUNNEL_PORT=""; TUNNEL_PORTS=""
+    HYSTERIA_BBR_PROFILE="aggressive"; MULTI_MODE="off"
+    BALANCER_STRATEGY="leastLoad"; LOCATION_NAME=""; MULTI_UDP_ENABLED="false"
+    FORWARD_MODE="direct"
 }
 
 # Persist every selection so the configuration can be edited later. This is the
@@ -1298,13 +1751,14 @@ reset_state() {
 save_state() {
     local tmp var
     local -a state_vars=(
-        ROLE ENGINE PROTOCOL TUNNEL_PORT REMOTE_IP UUID PASSWORD OBFS_PASS
+        ROLE ENGINE PROTOCOL TUNNEL_PORT TUNNEL_PORTS REMOTE_IP UUID PASSWORD OBFS_PASS
         SS_METHOD VMESS_SECURITY NETWORK WS_PATH HTTP_HOST GRPC_SERVICE HTTP_PATH
         SECURITY FLOW VLESS_ENC VLESS_ENCRYPTION VLESS_DECRYPTION
         REALITY_DEST REALITY_SNI REALITY_PUBLIC REALITY_PRIVATE REALITY_SHORTID
         REALITY_FINGERPRINT USE_REAL_SSL DOMAIN CERT_FILE KEY_FILE SERVER_NAME
         ALLOW_INSECURE CERT_SHA256 LOCAL_SERVER_NAME LOCAL_ALLOW_INSECURE
-        LOCAL_PINNED_SHA FORWARD_PORTS HYSTERIA_BBR_PROFILE
+        LOCAL_PINNED_SHA FORWARD_PORTS HYSTERIA_BBR_PROFILE MULTI_MODE
+        BALANCER_STRATEGY LOCATION_NAME FORWARD_MODE
     )
     mkdir -p "$CONF_DIR"
     chmod 700 "$CONF_DIR"
@@ -1326,25 +1780,36 @@ save_state() {
 # Load a previously saved configuration into the current shell. The file is
 # generated with printf %q, owned by root and private before it is sourced.
 load_state() {
-    local state="$CONF_DIR/wild.conf"
+    local state="$CONF_DIR/wild.conf" has_forward_mode=false
     [ -f "$state" ] || return 1
     [ ! -L "$state" ] || die "Refusing to load symlinked state file"
     [[ $(stat -c '%u' "$state" 2>/dev/null) == "0" ]] || die "State file must be owned by root"
     chmod 600 "$state" || die "Could not secure state file"
+    grep -q '^FORWARD_MODE=' "$state" && has_forward_mode=true
     # shellcheck disable=SC1090
     . "$state"
+    TUNNEL_PORTS="${TUNNEL_PORTS:-$TUNNEL_PORT}"
+    TUNNEL_PORT="${TUNNEL_PORT:-$(first_tunnel_port "$TUNNEL_PORTS")}"
+    MULTI_MODE="${MULTI_MODE:-off}"
+    BALANCER_STRATEGY="${BALANCER_STRATEGY:-leastLoad}"
+    # Preserve the forwarding behavior of installations created before v2.
+    # New installations start in direct mode via reset_state.
+    [ "$has_forward_mode" = true ] || FORWARD_MODE="tun-legacy"
+    [[ "$FORWARD_MODE" == "direct" || "$FORWARD_MODE" == "tun-legacy" ]] \
+        || die "Invalid forwarding mode in saved state"
     return 0
 }
 
 step_tunnel_port() {
     hint_back
     while true; do
-        read -p "Enter Tunnel Port (1-65535): " TUNNEL_PORT
-        [ "$TUNNEL_PORT" = "0" ] && return $BACK_RC
-        if [[ "$TUNNEL_PORT" =~ ^[0-9]+$ ]] && [ "$TUNNEL_PORT" -ge 1 ] && [ "$TUNNEL_PORT" -le 65535 ]; then
+        read -p "Enter Tunnel Port(s) (e.g., 443,2053 or 20000-20100): " TUNNEL_PORTS
+        [ "$TUNNEL_PORTS" = "0" ] && return $BACK_RC
+        if TUNNEL_PORTS=$(normalize_port_spec "$TUNNEL_PORTS"); then
+            TUNNEL_PORT=$(first_tunnel_port "$TUNNEL_PORTS")
             break
         fi
-        echo -e "${RED}Invalid port. Enter a number between 1 and 65535 (or 0 to go back).${NC}"
+        echo -e "${RED}Invalid ports. Use 1-65535, comma lists, or inclusive ranges.${NC}"
     done
     return 0
 }
@@ -1506,6 +1971,258 @@ lstep_forward_ports() {
     return 0
 }
 
+lstep_location_name() {
+    hint_back
+    read -p "Location name (e.g., USA-1): " LOCATION_NAME
+    [ "$LOCATION_NAME" = "0" ] && return $BACK_RC
+    [ -n "$LOCATION_NAME" ] || LOCATION_NAME="Location"
+    return 0
+}
+
+reset_location_fields() {
+    ENGINE="xray"; PROTOCOL=""; NETWORK="tcp"; SECURITY="none"; FLOW=""
+    VLESS_ENC="off"; VLESS_ENCRYPTION="none"; VLESS_DECRYPTION="none"
+    UUID=""; PASSWORD=""; OBFS_PASS=""; SS_METHOD="aes-256-gcm"; VMESS_SECURITY="auto"
+    WS_PATH="/"; HTTP_HOST=""; GRPC_SERVICE="grpc"; HTTP_PATH="/"
+    REALITY_SNI=""; REALITY_PUBLIC=""; REALITY_SHORTID=""; REALITY_FINGERPRINT="chrome"
+    LOCAL_SERVER_NAME=""; LOCAL_ALLOW_INSECURE="true"; LOCAL_PINNED_SHA=""
+    REMOTE_IP=""; TUNNEL_PORT=""; TUNNEL_PORTS=""; LOCATION_NAME=""
+    HYSTERIA_BBR_PROFILE="aggressive"
+}
+
+current_location_json() {
+    local id="$1" name="$2"
+    jq -n \
+        --arg id "$id" --arg name "$name" --arg engine "$ENGINE" \
+        --arg protocol "${PROTOCOL:-}" --arg address "${REMOTE_IP:-}" --arg ports "${TUNNEL_PORTS:-${TUNNEL_PORT:-}}" \
+        --arg uuid "${UUID:-}" --arg password "${PASSWORD:-}" --arg obfsPass "${OBFS_PASS:-}" \
+        --arg ssMethod "${SS_METHOD:-aes-256-gcm}" --arg vmessSecurity "${VMESS_SECURITY:-auto}" \
+        --arg network "${NETWORK:-tcp}" --arg wsPath "${WS_PATH:-/}" --arg httpHost "${HTTP_HOST:-}" \
+        --arg grpcService "${GRPC_SERVICE:-grpc}" --arg httpPath "${HTTP_PATH:-/}" \
+        --arg security "${SECURITY:-none}" --arg flow "${FLOW:-}" --arg vlessEnc "${VLESS_ENC:-off}" \
+        --arg vlessEncryption "${VLESS_ENCRYPTION:-none}" --arg realitySni "${REALITY_SNI:-}" \
+        --arg realityPublic "${REALITY_PUBLIC:-}" --arg realityShortId "${REALITY_SHORTID:-}" \
+        --arg realityFingerprint "${REALITY_FINGERPRINT:-chrome}" --arg serverName "${LOCAL_SERVER_NAME:-}" \
+        --arg allowInsecure "${LOCAL_ALLOW_INSECURE:-true}" --arg pinnedSha "${LOCAL_PINNED_SHA:-}" \
+        --arg hysteriaBbr "${HYSTERIA_BBR_PROFILE:-aggressive}" \
+        '{
+          id: $id, name: $name, engine: $engine, protocol: $protocol,
+          address: $address, ports: $ports, uuid: $uuid, password: $password,
+          obfsPass: $obfsPass, ssMethod: $ssMethod, vmessSecurity: $vmessSecurity,
+          network: $network, wsPath: $wsPath, httpHost: $httpHost,
+          grpcService: $grpcService, httpPath: $httpPath, security: $security,
+          flow: $flow, vlessEnc: $vlessEnc, vlessEncryption: $vlessEncryption,
+          realitySni: $realitySni, realityPublic: $realityPublic,
+          realityShortId: $realityShortId, realityFingerprint: $realityFingerprint,
+          serverName: $serverName, allowInsecure: $allowInsecure,
+          pinnedSha: $pinnedSha, hysteriaBbr: $hysteriaBbr
+        }'
+}
+
+install_locations_json() {
+    local source="$1" destination="${2:-$LOCATIONS_FILE}"
+    jq -e '
+      .version == 1 and
+      ((.strategy // "leastLoad") | IN("random", "roundRobin", "leastPing", "leastLoad")) and
+      (.nodes | type == "array") and (.nodes | length > 0 and length <= 256) and
+      (all(.nodes[];
+        type == "object" and
+        (.id | type == "string" and length > 0) and
+        (.name | type == "string" and length > 0) and
+        (.address | type == "string" and length > 0) and
+        (.ports | type == "string" and length > 0) and
+        (((.engine == "xray") and (.protocol | IN("vless", "vmess", "trojan", "shadowsocks", "socks"))) or
+         ((.engine == "hysteria") and (.protocol == "hysteria2"))))) and
+      (([.nodes[].id] | unique | length) == (.nodes | length))
+    ' "$source" >/dev/null \
+        || { rm -f -- "$source"; die "Invalid locations database"; }
+    install -m 0600 "$source" "$destination" || {
+        rm -f -- "$source"
+        die "Could not install locations database"
+    }
+    rm -f -- "$source"
+}
+
+initialize_locations_from_current() {
+    local tmp node id="loc1"
+    mkdir -p "$CONF_DIR"
+    node=$(current_location_json "$id" "${LOCATION_NAME:-Primary}") || die "Could not build primary location"
+    tmp=$(mktemp "$CONF_DIR/.locations.XXXXXX.json") || die "Could not create locations database"
+    jq -n --arg strategy "$BALANCER_STRATEGY" --argjson node "$node" \
+        '{version: 1, strategy: $strategy, nodes: [$node]}' > "$tmp" || {
+        rm -f -- "$tmp"; die "Could not initialize locations database"
+    }
+    install_locations_json "$tmp"
+    MULTI_MODE="on"
+}
+
+ensure_locations_from_legacy() {
+    [[ "$ROLE" == "local" ]] || return 0
+    if [ ! -f "$LOCATIONS_FILE" ]; then
+        LOCATION_NAME="${LOCATION_NAME:-Primary}"
+        TUNNEL_PORTS="${TUNNEL_PORTS:-$TUNNEL_PORT}"
+        initialize_locations_from_current
+    fi
+    MULTI_MODE="on"
+    BALANCER_STRATEGY=$(jq -r '.strategy // "leastLoad"' "$LOCATIONS_FILE")
+}
+
+location_count() {
+    [ -f "$LOCATIONS_FILE" ] || { printf '0\n'; return; }
+    jq -r '.nodes | length' "$LOCATIONS_FILE"
+}
+
+append_current_location() {
+    local tmp node count id
+    count=$(location_count); id="loc$((count + 1))-$(openssl rand -hex 3)"
+    node=$(current_location_json "$id" "$LOCATION_NAME") || die "Could not build location"
+    tmp=$(mktemp "$CONF_DIR/.locations.XXXXXX.json") || die "Could not update locations database"
+    jq --argjson node "$node" '.nodes += [$node]' "$LOCATIONS_FILE" > "$tmp" || {
+        rm -f -- "$tmp"; die "Could not append location"
+    }
+    install_locations_json "$tmp"
+}
+
+load_location_globals() {
+    local index="$1" encoded
+    encoded=$(jq -r --argjson i "$index" '.nodes[$i] | @base64' "$LOCATIONS_FILE")
+    [ -n "$encoded" ] && [ "$encoded" != "null" ] || return 1
+    node_field() { printf '%s' "$encoded" | base64 -d | jq -r ".$1 // \"\""; }
+    LOCATION_NAME=$(node_field name); ENGINE=$(node_field engine); PROTOCOL=$(node_field protocol)
+    REMOTE_IP=$(node_field address); TUNNEL_PORTS=$(node_field ports); TUNNEL_PORT=$(first_tunnel_port "$TUNNEL_PORTS")
+    UUID=$(node_field uuid); PASSWORD=$(node_field password); OBFS_PASS=$(node_field obfsPass)
+    SS_METHOD=$(node_field ssMethod); VMESS_SECURITY=$(node_field vmessSecurity)
+    NETWORK=$(node_field network); WS_PATH=$(node_field wsPath); HTTP_HOST=$(node_field httpHost)
+    GRPC_SERVICE=$(node_field grpcService); HTTP_PATH=$(node_field httpPath); SECURITY=$(node_field security)
+    FLOW=$(node_field flow); VLESS_ENC=$(node_field vlessEnc); VLESS_ENCRYPTION=$(node_field vlessEncryption)
+    REALITY_SNI=$(node_field realitySni); REALITY_PUBLIC=$(node_field realityPublic)
+    REALITY_SHORTID=$(node_field realityShortId); REALITY_FINGERPRINT=$(node_field realityFingerprint)
+    LOCAL_SERVER_NAME=$(node_field serverName); LOCAL_ALLOW_INSECURE=$(node_field allowInsecure)
+    LOCAL_PINNED_SHA=$(node_field pinnedSha); HYSTERIA_BBR_PROFILE=$(node_field hysteriaBbr)
+    unset -f node_field
+}
+
+collect_location_interactive() {
+    reset_location_fields
+    run_steps lstep_location_name lstep_remote_ip step_tunnel_port sstep_protocol sstep_creds \
+              sstep_transmission sstep_security sstep_vlessenc lstep_client_material || return $BACK_RC
+    validate_engine_port_spec "$ENGINE" "$TUNNEL_PORTS" || {
+        echo -e "${RED}The selected port specification is invalid for $ENGINE.${NC}"
+        return 1
+    }
+    return 0
+}
+
+list_locations() {
+    local count i
+    ensure_locations_from_legacy
+    count=$(location_count)
+    echo -e "${GREEN}Configured locations (strategy: $BALANCER_STRATEGY):${NC}"
+    for ((i=0; i<count; i++)); do
+        jq -r --argjson i "$i" '.nodes[$i] |
+          "  \($i + 1)) \(.name) — \(.engine)/\(.protocol)  \(.address):\(.ports)  \(.network)/\(.security)"' "$LOCATIONS_FILE"
+    done
+}
+
+choose_balancer_strategy() {
+    local choice tmp strategy
+    echo "1) leastLoad (recommended: stability + failover)"
+    echo "2) leastPing"
+    echo "3) roundRobin"
+    echo "4) random"
+    read -p "Strategy [1-4]: " choice
+    case "$choice" in
+        1) strategy="leastLoad" ;;
+        2) strategy="leastPing" ;;
+        3) strategy="roundRobin" ;;
+        4) strategy="random" ;;
+        *) echo -e "${RED}Invalid strategy.${NC}"; return 1 ;;
+    esac
+    tmp=$(mktemp "$CONF_DIR/.locations.XXXXXX.json") || die "Could not update strategy"
+    jq --arg strategy "$strategy" '.strategy = $strategy' "$LOCATIONS_FILE" > "$tmp" || {
+        rm -f -- "$tmp"; die "Could not update strategy"
+    }
+    install_locations_json "$tmp"
+    BALANCER_STRATEGY="$strategy"
+}
+
+choose_forward_mode() {
+    local choice
+    echo "Forwarding mode [current: $FORWARD_MODE]:"
+    echo "1) direct (recommended: Xray listens on forwarded ports; no TUN/tun2socks)"
+    echo "2) tun-legacy (compatibility fallback; keeps the old TUN pipeline)"
+    read -p "Mode [1-2, 0=cancel]: " choice
+    case "$choice" in
+        1)
+            FORWARD_MODE="direct"
+            echo -e "${YELLOW}Direct mode requires every forwarded port to be free on this server.${NC}"
+            ;;
+        2) FORWARD_MODE="tun-legacy" ;;
+        0) return 1 ;;
+        *) echo -e "${RED}Invalid mode.${NC}"; return 1 ;;
+    esac
+}
+
+remove_location_interactive() {
+    local choice count tmp index
+    count=$(location_count)
+    (( count > 1 )) || { echo -e "${RED}At least one location must remain.${NC}"; return 1; }
+    read -p "Location number to remove (0=cancel): " choice
+    [ "$choice" = "0" ] && return 1
+    [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= count )) || {
+        echo -e "${RED}Invalid location number.${NC}"; return 1
+    }
+    index=$((choice - 1))
+    tmp=$(mktemp "$CONF_DIR/.locations.XXXXXX.json") || die "Could not update locations"
+    jq --argjson i "$index" '.nodes |= (to_entries | map(select(.key != $i)) | map(.value))' \
+        "$LOCATIONS_FILE" > "$tmp" || { rm -f -- "$tmp"; die "Could not remove location"; }
+    install_locations_json "$tmp"
+}
+
+replace_location_interactive() {
+    local choice count tmp index id node
+    count=$(location_count)
+    read -p "Location number to reconfigure (0=cancel): " choice
+    [ "$choice" = "0" ] && return 1
+    [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= count )) || {
+        echo -e "${RED}Invalid location number.${NC}"; return 1
+    }
+    index=$((choice - 1)); id=$(jq -r --argjson i "$index" '.nodes[$i].id' "$LOCATIONS_FILE")
+    echo -e "${YELLOW}Re-enter all connection details for this location.${NC}"
+    collect_location_interactive || return 1
+    node=$(current_location_json "$id" "$LOCATION_NAME") || die "Could not rebuild location"
+    tmp=$(mktemp "$CONF_DIR/.locations.XXXXXX.json") || die "Could not update location"
+    jq --argjson i "$index" --argjson node "$node" '.nodes[$i] = $node' "$LOCATIONS_FILE" > "$tmp" || {
+        rm -f -- "$tmp"; die "Could not replace location"
+    }
+    install_locations_json "$tmp"
+}
+
+manage_locations() {
+    local choice
+    ensure_locations_from_legacy
+    while true; do
+        echo
+        list_locations
+        echo "1) Add location"
+        echo "2) Reconfigure location"
+        echo "3) Remove location"
+        echo "4) Change load-balancing strategy"
+        echo "5) Apply and restart"
+        echo "0) Back"
+        read -p "Select: " choice
+        case "$choice" in
+            1) collect_location_interactive && append_current_location ;;
+            2) replace_location_interactive ;;
+            3) remove_location_interactive ;;
+            4) choose_balancer_strategy ;;
+            5) apply_local ;;
+            0) return ;;
+            *) echo -e "${RED}Invalid option.${NC}" ;;
+        esac
+    done
+}
+
 # ---------------------------------------------------------------------------
 # Top-level actions
 # ---------------------------------------------------------------------------
@@ -1521,7 +2238,16 @@ do_remote_setup() {
         pause_enter
         return 1
     fi
-    check_port "$TUNNEL_PORT"
+    validate_engine_port_spec "$ENGINE" "$TUNNEL_PORTS" || {
+        echo -e "${RED}The selected tunnel-port specification is invalid for $ENGINE.${NC}"
+        pause_enter
+        return 1
+    }
+    if [[ "$ENGINE" == "xray" ]]; then
+        while read -r p; do check_port "$p"; done < <(expand_tunnel_ports "$TUNNEL_PORTS" 64)
+    else
+        check_port "$TUNNEL_PORT"
+    fi
     install_core
     # A previous local/Xray installation may have left a TUN forwarder behind.
     remove_forward_service
@@ -1541,25 +2267,32 @@ do_local_setup() {
     echo -e "${GREEN}--- Local Server Setup ---${NC}"
     echo "This installer is self-contained and does not touch the Sanaei/3x-ui panel."
     ensure_prerequisites
-    if ! run_steps lstep_remote_ip step_tunnel_port sstep_protocol sstep_creds \
+    if ! run_steps lstep_location_name lstep_remote_ip step_tunnel_port sstep_protocol sstep_creds \
                     sstep_transmission sstep_security sstep_vlessenc \
                     lstep_client_material lstep_forward_ports; then
         echo -e "${YELLOW}Setup cancelled - returning to main menu.${NC}"
         pause_enter
         return 1
     fi
-    install_core
-    if [[ "$ENGINE" == "xray" ]]; then
-        # Tear down rules using the old script before it is regenerated.
-        stop_forward_runtime
-    else
-        remove_forward_service
-    fi
+    validate_engine_port_spec "$ENGINE" "$TUNNEL_PORTS" || {
+        echo -e "${RED}The selected tunnel-port specification is invalid for $ENGINE.${NC}"
+        pause_enter
+        return 1
+    }
+    initialize_locations_from_current
+    while true; do
+        read -p "Add another remote location now? (y/n) [n]: " add_more
+        [[ "$add_more" == "y" || "$add_more" == "Y" ]] || break
+        collect_location_interactive && append_current_location || break
+    done
+    ensure_multi_cores
     create_local_config
+    prepare_local_forwarding
+    setup_hysteria_clients
     setup_service
-    [[ "$ENGINE" == "xray" ]] && setup_forward_service
+    finish_local_forwarding
     save_state
-    echo -e "${GREEN}Local (Iran) tunnel installed.${NC}"
+    echo -e "${GREEN}Local (Iran) tunnel installed (forwarding mode: $FORWARD_MODE).${NC}"
     pause_enter
     return 0
 }
@@ -1582,13 +2315,15 @@ edit_field() {
 edit_tunnel_port() {
     local new
     while true; do
-        read -p "Tunnel Port [current: $TUNNEL_PORT] (Enter=keep, 0=cancel): " new
+        read -p "Tunnel Port(s) [current: ${TUNNEL_PORTS:-$TUNNEL_PORT}] (Enter=keep, 0=cancel): " new
         [ "$new" = "0" ] && return 1
         [ -z "$new" ] && return 0
-        if [[ "$new" =~ ^[0-9]+$ ]] && [ "$new" -ge 1 ] && [ "$new" -le 65535 ]; then
-            TUNNEL_PORT="$new"; check_port "$TUNNEL_PORT"; return 0
+        if new=$(normalize_port_spec "$new") && validate_engine_port_spec "$ENGINE" "$new"; then
+            TUNNEL_PORTS="$new"; TUNNEL_PORT=$(first_tunnel_port "$new")
+            while read -r p; do check_port "$p"; done < <(expand_tunnel_ports "$new" 64 2>/dev/null || true)
+            return 0
         fi
-        echo -e "${RED}Invalid port. Enter 1-65535.${NC}"
+        echo -e "${RED}Invalid ports. Use 1-65535, comma lists, or inclusive ranges.${NC}"
     done
 }
 
@@ -1692,13 +2427,15 @@ edit_hysteria_bbr_profile() {
 }
 
 show_config_brief() {
-    echo -e "${YELLOW}Current:  role=$ROLE  protocol=$PROTOCOL  port=$TUNNEL_PORT  security=${SECURITY:-none}  network=${NETWORK:-tcp}${NC}"
+    echo -e "${YELLOW}Current:  role=$ROLE  protocol=$PROTOCOL  ports=${TUNNEL_PORTS:-$TUNNEL_PORT}  security=${SECURITY:-none}  network=${NETWORK:-tcp}${NC}"
     [[ "$ROLE" == "local" ]] && \
-        echo -e "${YELLOW}          remote_ip=$REMOTE_IP  forward_ports=$FORWARD_PORTS${NC}"
+        echo -e "${YELLOW}          remote_ip=$REMOTE_IP  forward_ports=$FORWARD_PORTS  mode=$FORWARD_MODE${NC}"
 }
 
 apply_remote() {
     echo -e "${GREEN}Applying changes on the Foreign (remote) server...${NC}"
+    TUNNEL_PORTS="${TUNNEL_PORTS:-$TUNNEL_PORT}"
+    validate_engine_port_spec "$ENGINE" "$TUNNEL_PORTS" || die "Invalid tunnel-port specification"
     ensure_core
     remove_forward_service
     remove_xray_bbr
@@ -1710,15 +2447,13 @@ apply_remote() {
 
 apply_local() {
     echo -e "${GREEN}Applying changes on the Iran (local) server...${NC}"
-    ensure_core
-    if [[ "$ENGINE" == "xray" ]]; then
-        stop_forward_runtime
-    else
-        remove_forward_service
-    fi
+    ensure_locations_from_legacy
+    ensure_multi_cores
     create_local_config
+    prepare_local_forwarding
+    setup_hysteria_clients
     setup_service
-    [[ "$ENGINE" == "xray" ]] && setup_forward_service
+    finish_local_forwarding
     save_state
     echo -e "${GREEN}Local configuration updated.${NC}"
 }
@@ -1766,8 +2501,36 @@ edit_remote() {
 }
 
 # --- Iran (local) side: has remote IP + forward ports, client-side material -
+edit_local_multi() {
+    local e dirty=0
+    ensure_locations_from_legacy
+    while true; do
+        echo
+        echo -e "${GREEN}--- Multi-Location Iran Configuration ---${NC}"
+        list_locations
+        echo "1) Manage Locations / Load Balancing"
+        echo "2) Forward Ports [current: $FORWARD_PORTS]"
+        echo "3) Forwarding Mode [current: $FORWARD_MODE]"
+        echo -e "${GREEN}a) Apply changes (regenerate config + restart)${NC}"
+        echo "0) Back to main menu"
+        read -p "Select: " e
+        case "$e" in
+            1) manage_locations ;;
+            2) edit_forward_ports && dirty=1 ;;
+            3) choose_forward_mode && dirty=1 ;;
+            a|A) apply_local; dirty=0 ;;
+            0) confirm_discard "$dirty" && return ;;
+            *) echo -e "${RED}Invalid option.${NC}" ;;
+        esac
+    done
+}
+
 edit_local() {
     local dirty=0 e
+    if [[ "$MULTI_MODE" == "on" || -f "$LOCATIONS_FILE" ]]; then
+        edit_local_multi
+        return
+    fi
     while true; do
         echo
         echo -e "${GREEN}--- Edit Iran (Local) Configuration ---${NC}"
@@ -1783,6 +2546,8 @@ edit_local() {
         [[ "$PROTOCOL" == "vless" && "$VLESS_ENC" == "on" ]] && echo "9) VLESS Encryption string"
         echo "10) Forward Ports"
         [[ "$ENGINE" == "hysteria" ]] && echo "11) Hysteria upload profile [current: $HYSTERIA_BBR_PROFILE]"
+        echo "12) Manage Locations / Load Balancing"
+        echo "13) Forwarding Mode [current: $FORWARD_MODE]"
         echo -e "${GREEN}a) Apply changes (regenerate config + restart)${NC}"
         echo "0) Back to main menu"
         read -p "Select: " e
@@ -1798,6 +2563,8 @@ edit_local() {
             9) if [[ "$PROTOCOL" == "vless" && "$VLESS_ENC" == "on" ]]; then edit_vless_enc_string && dirty=1; else echo -e "${RED}Not applicable.${NC}"; fi ;;
             10) edit_forward_ports && dirty=1 ;;
             11) if [[ "$ENGINE" == "hysteria" ]]; then edit_hysteria_bbr_profile && dirty=1; else echo -e "${RED}Not applicable.${NC}"; fi ;;
+            12) manage_locations ;;
+            13) choose_forward_mode && dirty=1 ;;
             a|A) apply_local; dirty=0 ;;
             0) confirm_discard "$dirty" && return ;;
             *) echo -e "${RED}Invalid option.${NC}" ;;
@@ -1828,6 +2595,7 @@ do_uninstall() {
     fi
     echo -e "${RED}Uninstalling Wild Tunnel...${NC}"
     remove_forward_service
+    remove_hysteria_clients
     remove_xray_bbr
     systemctl stop "$SERVICE" 2>/dev/null
     systemctl disable "$SERVICE" 2>/dev/null
@@ -1854,8 +2622,16 @@ pause_enter() { echo; read -p "Press Enter to continue..." _; }
 has_forward() { [ -f /etc/systemd/system/${FWD_SERVICE}.service ]; }
 
 svc_status() {
+    local id
     systemctl status "$SERVICE" --no-pager | head -n 15
     has_forward && { echo; systemctl status "$FWD_SERVICE" --no-pager | head -n 15; }
+    if [ -f "$HYSTERIA_CLIENT_LIST" ]; then
+        while read -r id; do
+            [ -n "$id" ] || continue
+            echo
+            systemctl status "${HYSTERIA_CLIENT_SERVICE}@${id}.service" --no-pager | head -n 10
+        done < "$HYSTERIA_CLIENT_LIST"
+    fi
 }
 
 svc_logs() {
@@ -1864,6 +2640,10 @@ svc_logs() {
 }
 
 restart_services() {
+    if ! restart_hysteria_clients; then
+        echo -e "${RED}A Hysteria location failed to restart.${NC}"
+        return 1
+    fi
     if ! systemctl restart "$SERVICE" || ! systemctl is-active --quiet "$SERVICE"; then
         echo -e "${RED}Tunnel restart failed.${NC}"
         journalctl -u "$SERVICE" -n 20 --no-pager
@@ -1905,8 +2685,8 @@ post_install_menu() {
         case "$opt" in
             1) svc_status ;;
             2) restart_services ;;
-            3) systemctl stop "$SERVICE"; has_forward && systemctl stop "$FWD_SERVICE"; echo -e "${YELLOW}Stopped.${NC}" ;;
-            4) systemctl start "$SERVICE"; has_forward && systemctl start "$FWD_SERVICE"; echo -e "${GREEN}Started.${NC}" ;;
+            3) systemctl stop "$SERVICE"; has_forward && systemctl stop "$FWD_SERVICE"; stop_hysteria_clients; echo -e "${YELLOW}Stopped.${NC}" ;;
+            4) start_hysteria_clients; systemctl start "$SERVICE"; has_forward && systemctl start "$FWD_SERVICE"; echo -e "${GREEN}Started.${NC}" ;;
             5) svc_logs ;;
             6) show_full_config ;;
             7) do_edit ;;
