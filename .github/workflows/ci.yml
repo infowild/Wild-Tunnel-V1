@@ -1,0 +1,20 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y jq python3-yaml shellcheck
+      - name: Shell syntax and generated-config tests
+        run: sudo bash tests/test_static.sh
+      - name: ShellCheck errors
+        run: shellcheck --severity=error install.sh tests/test_static.sh

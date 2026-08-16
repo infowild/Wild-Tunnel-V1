@@ -11,6 +11,11 @@
 # TCP/UDP port already used by the panel or another service, which the
 # installer warns about before binding.
 
+# Configurations contain credentials, certificate material and private keys.
+# Keep every generated file private unless a broader mode is explicitly needed.
+umask 077
+set -o pipefail
+
 # Colors
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -23,12 +28,17 @@ NC='\033[0m' # No Color
 XRAY_VERSION="v26.3.27"
 HYSTERIA_VERSION="v2.9.3"
 TUN2SOCKS_VERSION="v2.7.0"
+XRAY_SHA256="23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae"
+HYSTERIA_SHA256="66dbdb0608f25f3057b433afe975a9fc1af2ca8e512479e294988b3ef363d6c1"
+TUN2SOCKS_SHA256="a612baa287a3b6de6221f74fd02b442a50888508227ecf51e1288a5ccbb77381"
 
 # Paths
 CORE_DIR="/usr/local/bin/wild-xray"
 CONF_DIR="/etc/wild-tunnel"
 SERVICE="wild-tunnel"
 FWD_SERVICE="wild-forward"
+CRON_TAG="# wild-tunnel-restart"
+BBR_MODULE_FILE="/etc/modules-load.d/wild-tunnel-bbr.conf"
 
 # Local port-forwarding (Xray engine) settings
 SOCKS_PORT="10808"            # local-only SOCKS inbound that tun2socks feeds
@@ -36,6 +46,10 @@ TUN_NAME="wildtun0"           # TUN device created on the local (Iran) side
 TUN_ADDR="198.18.0.1"         # address assigned to the TUN device
 TUN_CIDR="15"                 # 198.18.0.0/15 (RFC 2544 benchmarking range)
 SENTINEL_IP="198.18.0.2"      # DNAT target routed into the TUN (ignored by remote)
+TUN_MTU="1500"               # explicit netstack MTU
+TUN_TXQLEN="10000"          # absorb upload bursts before userspace drains the TUN
+TUN_TCP_RCVBUF="4m"          # tun2socks upload-side receive window
+HYSTERIA_BBR_PROFILE="aggressive" # local/client upload congestion profile
 
 # Runtime state
 ENGINE="xray"                 # xray | hysteria
@@ -66,6 +80,24 @@ VLESS_DECRYPTION="none"
 VLESS_ENCRYPTION="none"
 
 die() { echo -e "${RED}Error: $1${NC}" >&2; exit 1; }
+
+verify_sha256() {
+    local file="$1" expected="$2" actual
+    actual=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
+    [[ -n "$actual" && "$actual" == "$expected" ]] || {
+        rm -f -- "$file"
+        die "SHA-256 verification failed for a downloaded asset"
+    }
+}
+
+download_verified() {
+    local url="$1" expected="$2" output="$3"
+    wget --https-only --timeout=30 --tries=3 -qO "$output" "$url" || {
+        rm -f -- "$output"
+        die "Failed to download $url"
+    }
+    verify_sha256 "$output" "$expected"
+}
 
 # ---------------------------------------------------------------------------
 # Interactive navigation helpers (step-by-step Back with "0")
@@ -122,10 +154,14 @@ hint_back() { echo -e "${YELLOW}(enter 0 to go Back)${NC}"; }
 # ---------------------------------------------------------------------------
 
 ensure_prerequisites() {
+    [[ $(id -u) -eq 0 ]] || die "Run this installer as root"
+    [[ $(uname -m) == "x86_64" ]] || die "This release currently supports x86_64/amd64 only"
+    command -v systemctl >/dev/null 2>&1 || die "systemd is required"
+    command -v apt-get >/dev/null 2>&1 || die "Ubuntu/Debian with apt-get is required"
     echo -e "${GREEN}Updating package lists and installing prerequisites...${NC}"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -q || die "apt-get update failed"
-    apt-get install -y unzip uuid-runtime jq openssl wget curl ca-certificates iproute2 iptables cron \
+    apt-get install -y unzip uuid-runtime jq openssl wget ca-certificates iproute2 iptables cron python3 python3-yaml \
         || die "Failed to install prerequisites"
     # Make sure the cron daemon is running so scheduled restarts work.
     systemctl enable --now cron >/dev/null 2>&1 || true
@@ -145,36 +181,45 @@ check_port() {
 
 install_xray() {
     echo -e "${GREEN}Installing Xray core (${XRAY_VERSION})...${NC}"
+    local archive extract_dir
+    archive=$(mktemp) || die "Could not create a temporary download file"
+    extract_dir=$(mktemp -d) || { rm -f -- "$archive"; die "Could not create a temporary extraction directory"; }
     mkdir -p "$CORE_DIR" "$CONF_DIR"
-    wget -qO /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" \
-        || die "Failed to download Xray core"
-    unzip -qo /tmp/xray.zip -d "$CORE_DIR/" || die "Failed to extract Xray core"
-    rm -f /tmp/xray.zip
-    chmod +x "$CORE_DIR/xray"
+    download_verified "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip" "$XRAY_SHA256" "$archive"
+    unzip -qo "$archive" -d "$extract_dir/" || { rm -f -- "$archive"; rm -rf -- "$extract_dir"; die "Failed to extract Xray core"; }
+    [ -f "$extract_dir/xray" ] || { rm -f -- "$archive"; rm -rf -- "$extract_dir"; die "Xray binary is missing from the release archive"; }
+    install -m 0755 "$extract_dir/xray" "$CORE_DIR/xray" || { rm -f -- "$archive"; rm -rf -- "$extract_dir"; die "Failed to install Xray core"; }
+    rm -f -- "$archive"
+    rm -rf -- "$extract_dir"
     [ -x "$CORE_DIR/xray" ] || die "Xray binary is missing after installation"
 }
 
 install_hysteria() {
     echo -e "${GREEN}Installing Hysteria2 core (${HYSTERIA_VERSION})...${NC}"
+    local binary
+    binary=$(mktemp) || die "Could not create a temporary download file"
     mkdir -p "$CORE_DIR" "$CONF_DIR"
-    wget -qO "$CORE_DIR/hysteria" "https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/hysteria-linux-amd64" \
-        || die "Failed to download Hysteria2 core"
-    chmod +x "$CORE_DIR/hysteria"
+    download_verified "https://github.com/apernet/hysteria/releases/download/app/${HYSTERIA_VERSION}/hysteria-linux-amd64" "$HYSTERIA_SHA256" "$binary"
+    install -m 0755 "$binary" "$CORE_DIR/hysteria" || { rm -f -- "$binary"; die "Failed to install Hysteria2 core"; }
+    rm -f -- "$binary"
     [ -x "$CORE_DIR/hysteria" ] || die "Hysteria binary is missing after installation"
 }
 
 install_tun2socks() {
-    # Already present (e.g. during an edit/apply): keep the pinned binary.
+    # Already present (e.g. during an edit/apply): keep the verified pinned binary.
     [ -x "$CORE_DIR/tun2socks" ] && return 0
+    local archive extract_dir source_binary
+    archive=$(mktemp) || die "Could not create a temporary download file"
+    extract_dir=$(mktemp -d) || { rm -f -- "$archive"; die "Could not create a temporary extraction directory"; }
     echo -e "${GREEN}Installing tun2socks (${TUN2SOCKS_VERSION})...${NC}"
     mkdir -p "$CORE_DIR"
-    wget -qO /tmp/tun2socks.zip "https://github.com/xjasonlyu/tun2socks/releases/download/${TUN2SOCKS_VERSION}/tun2socks-linux-amd64.zip" \
-        || die "Failed to download tun2socks"
-    unzip -qo /tmp/tun2socks.zip -d "$CORE_DIR/" || die "Failed to extract tun2socks"
-    rm -f /tmp/tun2socks.zip
-    # The archive ships the binary as tun2socks-linux-amd64; normalise the name.
-    [ -f "$CORE_DIR/tun2socks-linux-amd64" ] && mv -f "$CORE_DIR/tun2socks-linux-amd64" "$CORE_DIR/tun2socks"
-    chmod +x "$CORE_DIR/tun2socks"
+    download_verified "https://github.com/xjasonlyu/tun2socks/releases/download/${TUN2SOCKS_VERSION}/tun2socks-linux-amd64.zip" "$TUN2SOCKS_SHA256" "$archive"
+    unzip -qo "$archive" -d "$extract_dir/" || { rm -f -- "$archive"; rm -rf -- "$extract_dir"; die "Failed to extract tun2socks"; }
+    source_binary="$extract_dir/tun2socks-linux-amd64"
+    [ -f "$source_binary" ] || { rm -f -- "$archive"; rm -rf -- "$extract_dir"; die "tun2socks binary is missing from the release archive"; }
+    install -m 0755 "$source_binary" "$CORE_DIR/tun2socks" || { rm -f -- "$archive"; rm -rf -- "$extract_dir"; die "Failed to install tun2socks"; }
+    rm -f -- "$archive"
+    rm -rf -- "$extract_dir"
     [ -x "$CORE_DIR/tun2socks" ] || die "tun2socks binary is missing after installation"
 }
 
@@ -199,7 +244,7 @@ ensure_core() {
 
 setup_service() {
     echo -e "${GREEN}Setting up Systemd service...${NC}"
-    local exec_cmd
+    local exec_cmd unit_tmp
     if [[ "$ENGINE" == "hysteria" ]]; then
         if [[ "$ROLE" == "remote" ]]; then
             exec_cmd="$CORE_DIR/hysteria server -c $CONF_DIR/config.yaml"
@@ -210,18 +255,24 @@ setup_service() {
         exec_cmd="$CORE_DIR/xray run -config $CONF_DIR/config.json"
     fi
 
-    # Generate the unit inline so the installer does not depend on its own CWD.
-    cat <<EOF > /etc/systemd/system/${SERVICE}.service
+    unit_tmp=$(mktemp) || die "Could not create a temporary systemd unit"
+    cat <<EOF > "$unit_tmp"
 [Unit]
 Description=Wild Tunnel Service
-Documentation=https://github.com/xtls
-After=network.target nss-lookup.target
+Documentation=https://github.com/infowild/Wild-Tunnel-V1
+Wants=network-online.target
+After=network-online.target nss-lookup.target
 
 [Service]
 User=root
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=$CONF_DIR
+UMask=0077
 ExecStart=$exec_cmd
 Restart=on-failure
 RestartPreventExitStatus=23
@@ -231,141 +282,128 @@ LimitNOFILE=1000000
 [Install]
 WantedBy=multi-user.target
 EOF
+    install -m 0644 "$unit_tmp" /etc/systemd/system/${SERVICE}.service || {
+        rm -f -- "$unit_tmp"
+        die "Failed to install systemd unit"
+    }
+    rm -f -- "$unit_tmp"
 
-    systemctl daemon-reload
-    systemctl enable "$SERVICE"
-    systemctl restart "$SERVICE"
+    systemctl daemon-reload || die "systemd daemon-reload failed"
+    systemctl enable "$SERVICE" || die "Could not enable $SERVICE"
+    if ! systemctl restart "$SERVICE" || ! systemctl is-active --quiet "$SERVICE"; then
+        journalctl -u "$SERVICE" -n 30 --no-pager >&2
+        die "$SERVICE failed to start"
+    fi
     echo -e "${GREEN}Wild Tunnel started successfully!${NC}"
     systemctl status "$SERVICE" --no-pager | head -n 10
     install_shortcut
 }
 
-install_shortcut() {
-    # Install the `wild` management command so the tunnel can be controlled
-    # from anywhere after installation.
-    cat <<'WILDCMD' > /usr/local/bin/wild
-#!/bin/bash
-GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; CYAN='\033[1;36m'; BOLD='\033[1m'; NC='\033[0m'
-CONF_DIR="/etc/wild-tunnel"
-CORE_DIR="/usr/local/bin/wild-xray"
-SERVICE="wild-tunnel"
-FWD_SERVICE="wild-forward"
-CRON_TAG="# wild-tunnel-restart"
-
-show_banner() {
-    clear 2>/dev/null
-    echo -e "${CYAN}"
-    cat <<'BANNER'
-   ██╗    ██╗██╗██╗     ██████╗
-   ██║    ██║██║██║     ██╔══██╗
-   ██║ █╗ ██║██║██║     ██║  ██║
-   ██║███╗██║██║██║     ██║  ██║
-   ╚███╔███╔╝██║███████╗██████╔╝
-    ╚══╝╚══╝ ╚═╝╚══════╝╚═════╝
-   ████████╗██╗   ██╗███╗   ██╗███╗   ██╗███████╗██╗
-   ╚══██╔══╝██║   ██║████╗  ██║████╗  ██║██╔════╝██║
-      ██║   ██║   ██║██╔██╗ ██║██╔██╗ ██║█████╗  ██║
-      ██║   ██║   ██║██║╚██╗██║██║╚██╗██║██╔══╝  ██║
-      ██║   ╚██████╔╝██║ ╚████║██║ ╚████║███████╗███████╗
-      ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚═╝  ╚═══╝╚══════╝╚══════╝
-BANNER
-    echo -e "${NC}"
-    echo -e "${BOLD}${YELLOW}        «  W I L D   T U N N E L   ·   V 1  »${NC}"
-    echo -e "${GREEN}     GitHub: ${NC}${BOLD}https://github.com/infowild/Wild-Tunnel-V1${NC}"
-    echo -e "${CYAN}   ────────────────────────────────────────────────────────${NC}"
-    echo
+remove_cron() {
+    local current
+    current=$(crontab -l 2>/dev/null || true)
+    { printf '%s\n' "$current" | grep -vF "$CRON_TAG" || true; } | crontab - || die "Could not update root crontab"
 }
 
-pause_enter() { echo; read -p "Press Enter to continue..." _; }
-has_forward() { [ -f /etc/systemd/system/${FWD_SERVICE}.service ]; }
-remove_cron() { crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab - 2>/dev/null; }
-
 schedule_restart() {
+    local choice expr current
     echo "Schedule automatic restart:"
     echo "1) Every 6 hours"
     echo "2) Every 12 hours"
     echo "3) Every day at 04:00"
     echo "4) Custom cron expression"
-    read -p "Choice [1-4]: " c
-    local expr
-    case $c in
+    read -p "Choice [1-4]: " choice
+    case $choice in
         1) expr="0 */6 * * *" ;;
         2) expr="0 */12 * * *" ;;
         3) expr="0 4 * * *" ;;
-        4) read -p "Enter cron expression (e.g. '0 */8 * * *'): " expr ;;
-        *) echo -e "${RED}Invalid choice.${NC}"; return ;;
+        4) read -p "Enter cron expression: " expr ;;
+        *) echo -e "${RED}Invalid choice.${NC}"; return 1 ;;
     esac
-    [ -z "$expr" ] && { echo -e "${RED}Empty expression.${NC}"; return; }
-    remove_cron
-    ( crontab -l 2>/dev/null; echo "$expr systemctl restart $SERVICE $CRON_TAG" ) | crontab - \
-        && echo -e "${GREEN}Scheduled: '$expr' -> restart $SERVICE${NC}"
+    [[ -n "$expr" && "$expr" =~ ^[0-9A-Za-z*/?,[:space:]-]+$ ]] || {
+        echo -e "${RED}Invalid cron expression.${NC}"
+        return 1
+    }
+    current=$(crontab -l 2>/dev/null || true)
+    {
+        printf '%s\n' "$current" | grep -vF "$CRON_TAG" || true
+        printf '%s systemctl restart %s %s\n' "$expr" "$SERVICE" "$CRON_TAG"
+    } | crontab - || die "Could not install restart schedule"
+    echo -e "${GREEN}Scheduled: '$expr' -> restart $SERVICE${NC}"
 }
 
-do_uninstall() {
-    systemctl stop "$FWD_SERVICE" 2>/dev/null
-    systemctl disable "$FWD_SERVICE" 2>/dev/null
-    [ -f "$CONF_DIR/forward-down.sh" ] && bash "$CONF_DIR/forward-down.sh" 2>/dev/null
-    rm -f /etc/systemd/system/${FWD_SERVICE}.service
-    systemctl stop "$SERVICE" 2>/dev/null
-    systemctl disable "$SERVICE" 2>/dev/null
-    remove_cron
-    rm -f /etc/systemd/system/${SERVICE}.service
-    rm -f /etc/letsencrypt/renewal-hooks/deploy/wild-tunnel.sh
-    rm -rf "$CORE_DIR" "$CONF_DIR"
-    systemctl daemon-reload
-    systemctl reset-failed "$SERVICE" 2>/dev/null
-    systemctl reset-failed "$FWD_SERVICE" 2>/dev/null
-    rm -f /usr/local/bin/wild
-    echo -e "${GREEN}Uninstallation complete.${NC}"
-}
+install_shortcut() {
+    # Build the installed manager from the functions in this exact verified
+    # installer, so the wild command cannot drift from edit/install behavior.
+    local manager_dir="/usr/local/lib/wild-tunnel"
+    local manager="$manager_dir/manager.sh" manager_tmp wrapper_tmp var
+    local -a manager_vars=(
+        GREEN RED YELLOW CYAN BOLD NC
+        XRAY_VERSION HYSTERIA_VERSION TUN2SOCKS_VERSION
+        XRAY_SHA256 HYSTERIA_SHA256 TUN2SOCKS_SHA256
+        CORE_DIR CONF_DIR SERVICE FWD_SERVICE CRON_TAG BBR_MODULE_FILE
+        SOCKS_PORT TUN_NAME TUN_ADDR TUN_CIDR SENTINEL_IP
+        TUN_MTU TUN_TXQLEN TUN_TCP_RCVBUF HYSTERIA_BBR_PROFILE
+        BACK_RC SKIP_RC
+    )
+    mkdir -p "$manager_dir"
+    chmod 700 "$manager_dir"
+    manager_tmp=$(mktemp "$manager_dir/.manager.XXXXXX") || die "Could not create manager script"
+    {
+        echo '#!/bin/bash'
+        echo 'umask 077'
+        echo 'set -o pipefail'
+        for var in "${manager_vars[@]}"; do
+            printf '%s=%q\n' "$var" "${!var}"
+        done
+        declare -f
+        echo
+        echo 'main_menu'
+    } > "$manager_tmp"
+    install -m 0700 "$manager_tmp" "$manager" || {
+        rm -f -- "$manager_tmp"
+        die "Could not install management script"
+    }
+    rm -f -- "$manager_tmp"
 
-while true; do
-    show_banner
-    echo -e "${GREEN}Wild Tunnel Management${NC}"
-    echo "1) Status"
-    echo "2) Restart"
-    echo "3) Stop"
-    echo "4) Start"
-    echo "5) Live logs (Ctrl+C to exit)"
-    echo "6) Show config"
-    echo "7) Schedule auto-restart (cron)"
-    echo "8) Remove scheduled restart"
-    echo "9) Uninstall"
-    echo "0) Exit"
-    read -p "Select an option [0-9]: " opt
-    case $opt in
-        1) systemctl status "$SERVICE" --no-pager | head -n 15
-           has_forward && { echo; systemctl status "$FWD_SERVICE" --no-pager | head -n 15; } ;;
-        2) systemctl restart "$SERVICE"; has_forward && systemctl restart "$FWD_SERVICE"
-           echo -e "${GREEN}Restarted.${NC}" ;;
-        3) systemctl stop "$SERVICE"; has_forward && systemctl stop "$FWD_SERVICE"
-           echo -e "${YELLOW}Stopped.${NC}" ;;
-        4) systemctl start "$SERVICE"; has_forward && systemctl start "$FWD_SERVICE"
-           echo -e "${GREEN}Started.${NC}" ;;
-        5) echo -e "${YELLOW}Live logs. Press Ctrl+C to stop.${NC}"; journalctl -u "$SERVICE" -f ;;
-        6) cat "$CONF_DIR"/config.* 2>/dev/null || echo -e "${RED}No config found.${NC}" ;;
-        7) schedule_restart ;;
-        8) remove_cron && echo -e "${GREEN}Scheduled restart removed.${NC}" ;;
-        9) do_uninstall; pause_enter; exit 0 ;;
-        0) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
-        *) echo -e "${RED}Invalid option.${NC}" ;;
-    esac
-    pause_enter
-done
+    wrapper_tmp=$(mktemp) || die "Could not create command wrapper"
+    cat <<'WILDCMD' > "$wrapper_tmp"
+#!/bin/bash
+exec /usr/local/lib/wild-tunnel/manager.sh "$@"
 WILDCMD
-    chmod +x /usr/local/bin/wild
-    echo -e "${GREEN}Shortcut installed: run 'wild' to manage the tunnel.${NC}"
+    install -m 0755 "$wrapper_tmp" /usr/local/bin/wild || {
+        rm -f -- "$wrapper_tmp"
+        die "Could not install wild command"
+    }
+    rm -f -- "$wrapper_tmp"
+    echo -e "${GREEN}Shortcut installed: run 'wild' to manage or edit the tunnel.${NC}"
 }
 
-generate_uuid() { uuidgen; }
-generate_password() { tr -dc A-Za-z0-9 </dev/urandom | head -c 16; }
+generate_uuid() {
+    uuidgen
+}
 
-# SHA-256 fingerprint of a certificate, in the lowercase hex form Xray expects
-# for "pinnedPeerCertSha256". Xray v26 REMOVED "allowInsecure", so a self-signed
-# certificate can only be trusted by pinning this value on the client side.
+generate_password() {
+    # Exactly 16 printable hexadecimal characters, without a truncating pipeline
+    # that would fail under pipefail because of SIGPIPE.
+    openssl rand -hex 8
+}
+
 cert_sha256() {
-    openssl x509 -noout -fingerprint -sha256 -in "$1" 2>/dev/null \
-        | sed 's/.*=//; s/://g' | tr 'A-Z' 'a-z'
+    # OpenSSL's colon-separated form is accepted by both Xray and Hysteria.
+    openssl x509 -noout -fingerprint -sha256 -in "$1" 2>/dev/null |
+        sed 's/.*=//'
+}
+
+normalize_cert_pin() {
+    local compact="${1//:/}" output=""
+    [[ "$compact" =~ ^[A-Fa-f0-9]{64}$ ]] || return 1
+    compact="${compact^^}"
+    while [ -n "$compact" ]; do
+        output="${output:+$output:}${compact:0:2}"
+        compact="${compact:2}"
+    done
+    printf '%s\n' "$output"
 }
 
 # ---------------------------------------------------------------------------
@@ -477,19 +515,29 @@ prompt_transmission() {
 }
 
 prompt_security_choice() {
-    echo -e "${GREEN}Select Security:${NC}"
-    echo "1) none"
-    echo "2) tls"
-    echo "3) reality"
-    echo "0) Back"
-    read -p "Security [1-3, 0=Back]: " sopt
-    case $sopt in
-        0) return $BACK_RC;;
-        1) SECURITY="none";;
-        2) SECURITY="tls";;
-        3) SECURITY="reality";;
-        *) SECURITY="none"; echo "Defaulting to none";;
-    esac
+    while true; do
+        echo -e "${GREEN}Select Security:${NC}"
+        echo "1) none"
+        echo "2) tls"
+        echo "3) reality"
+        echo "0) Back"
+        read -p "Security [1-3, 0=Back]: " sopt
+        case $sopt in
+            0) return $BACK_RC;;
+            1) SECURITY="none";;
+            2) SECURITY="tls";;
+            3) SECURITY="reality";;
+            *) echo -e "${RED}Invalid choice.${NC}"; continue;;
+        esac
+
+        # Xray's compatibility matrix does not support REALITY over WebSocket
+        # or HTTPUpgrade. Refuse the combination before any config is written.
+        if [[ "$SECURITY" == "reality" && ( "$NETWORK" == "ws" || "$NETWORK" == "httpupgrade" ) ]]; then
+            echo -e "${RED}REALITY is not supported with $NETWORK. Choose TLS, or go back and select tcp/grpc.${NC}"
+            continue
+        fi
+        break
+    done
 
     if [[ "$SECURITY" == "none" && ( "$NETWORK" == "http" || "$NETWORK" == "grpc" ) ]]; then
         echo -e "${YELLOW}Note: '$NETWORK' transmission normally needs tls or reality; 'none' may fail to connect.${NC}"
@@ -498,11 +546,9 @@ prompt_security_choice() {
     if [[ "$SECURITY" == "none" ]]; then
         echo -e "${YELLOW}Warning: without tls/reality the tunnel is fingerprintable; Iran's DPI drops its return traffic. REALITY is recommended.${NC}"
     elif [[ "$PROTOCOL" == "shadowsocks" || "$PROTOCOL" == "socks" ]]; then
-        echo -e "${YELLOW}Note: with tls/reality, $PROTOCOL forwards TCP only (its UDP would bypass the camouflage unmasked).${NC}"
+        echo -e "${YELLOW}Note: with tls/reality, $PROTOCOL forwards TCP only; local UDP is disabled to prevent an unmasked native-UDP leak.${NC}"
     fi
 
-    # XTLS Vision only applies to VLESS over raw TCP with a TLS-like security
-    # layer, and is mutually exclusive with VLESS Encryption (set later).
     if [[ "$PROTOCOL" == "vless" && "$NETWORK" == "tcp" && ( "$SECURITY" == "tls" || "$SECURITY" == "reality" ) ]]; then
         FLOW="xtls-rprx-vision"
     else
@@ -569,53 +615,86 @@ gen_vless_enc() {
 # JSON fragment builders
 # ---------------------------------------------------------------------------
 
+remove_xray_bbr() {
+    rm -f -- "$BBR_MODULE_FILE"
+}
+
+configure_xray_bbr() {
+    local tmp available
+    command -v modprobe >/dev/null 2>&1 || return 0
+    modprobe tcp_bbr >/dev/null 2>&1 || { remove_xray_bbr; return 0; }
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    if [[ " $available " != *" bbr "* ]]; then
+        remove_xray_bbr
+        return 0
+    fi
+    tmp=$(mktemp) || die "Could not create temporary BBR module configuration"
+    printf '%s\n' tcp_bbr > "$tmp"
+    install -m 0644 "$tmp" "$BBR_MODULE_FILE" || {
+        rm -f -- "$tmp"
+        die "Could not persist the BBR kernel module"
+    }
+    rm -f -- "$tmp"
+}
+
+preferred_tcp_congestion() {
+    local available
+    available=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)
+    [[ " $available " == *" bbr "* ]] && printf '%s\n' bbr
+}
+
 # streamSettings inner JSON. $1 = remote|local
 stream_json() {
     local role="$1"
     local parts=()
-    parts+=("\"network\": \"$NETWORK\"")
+    parts+=("\"network\": $(json_quote "$NETWORK")")
 
     case "$NETWORK" in
         ws)
-            local ws="\"path\": \"$WS_PATH\""
-            [ -n "$HTTP_HOST" ] && ws="$ws, \"headers\": { \"Host\": \"$HTTP_HOST\" }"
+            local ws="\"path\": $(json_quote "$WS_PATH")"
+            [ -n "$HTTP_HOST" ] && ws="$ws, \"headers\": { \"Host\": $(json_quote "$HTTP_HOST") }"
             parts+=("\"wsSettings\": { $ws }")
             ;;
         httpupgrade)
-            local hu="\"path\": \"$WS_PATH\""
-            [ -n "$HTTP_HOST" ] && hu="$hu, \"host\": \"$HTTP_HOST\""
+            local hu="\"path\": $(json_quote "$WS_PATH")"
+            [ -n "$HTTP_HOST" ] && hu="$hu, \"host\": $(json_quote "$HTTP_HOST")"
             parts+=("\"httpupgradeSettings\": { $hu }")
             ;;
         grpc)
-            parts+=("\"grpcSettings\": { \"serviceName\": \"$GRPC_SERVICE\" }")
+            parts+=("\"grpcSettings\": { \"serviceName\": $(json_quote "$GRPC_SERVICE") }")
             ;;
         http)
-            local h="\"path\": \"$HTTP_PATH\""
-            [ -n "$HTTP_HOST" ] && h="$h, \"host\": [ \"$HTTP_HOST\" ]"
-            parts+=("\"httpSettings\": { $h }")
+            local http="\"path\": $(json_quote "$HTTP_PATH")"
+            [ -n "$HTTP_HOST" ] && http="$http, \"host\": [ $(json_quote "$HTTP_HOST") ]"
+            parts+=("\"httpSettings\": { $http }")
             ;;
     esac
+
+    # Apply BBR only to the local outbound tunnel socket when supported.
+    # This targets upload without changing the host-wide congestion controller.
+    if [[ "$role" == "local" ]]; then
+        local tcp_cc
+        tcp_cc=$(preferred_tcp_congestion)
+        [ -n "$tcp_cc" ] && parts+=("\"sockopt\": { \"tcpcongestion\": $(json_quote "$tcp_cc") }")
+    fi
 
     case "$SECURITY" in
         tls)
             parts+=("\"security\": \"tls\"")
             if [[ "$role" == "remote" ]]; then
-                parts+=("\"tlsSettings\": { \"certificates\": [ { \"certificateFile\": \"$CERT_FILE\", \"keyFile\": \"$KEY_FILE\" } ] }")
+                parts+=("\"tlsSettings\": { \"certificates\": [ { \"certificateFile\": $(json_quote "$CERT_FILE"), \"keyFile\": $(json_quote "$KEY_FILE") } ] }")
             else
-                # A real (Let's Encrypt) certificate validates normally. A
-                # self-signed one must be pinned by fingerprint: Xray v26 removed
-                # "allowInsecure" and fails to start if it is present.
-                local tls_local="\"serverName\": \"$LOCAL_SERVER_NAME\""
-                [ -n "$LOCAL_PINNED_SHA" ] && tls_local="$tls_local, \"pinnedPeerCertSha256\": \"$LOCAL_PINNED_SHA\""
+                local tls_local="\"serverName\": $(json_quote "$LOCAL_SERVER_NAME")"
+                [ -n "$LOCAL_PINNED_SHA" ] && tls_local="$tls_local, \"pinnedPeerCertSha256\": $(json_quote "$LOCAL_PINNED_SHA")"
                 parts+=("\"tlsSettings\": { $tls_local }")
             fi
             ;;
         reality)
             parts+=("\"security\": \"reality\"")
             if [[ "$role" == "remote" ]]; then
-                parts+=("\"realitySettings\": { \"show\": false, \"dest\": \"$REALITY_DEST\", \"serverNames\": [ \"$REALITY_SNI\" ], \"privateKey\": \"$REALITY_PRIVATE\", \"shortIds\": [ \"$REALITY_SHORTID\" ] }")
+                parts+=("\"realitySettings\": { \"show\": false, \"dest\": $(json_quote "$REALITY_DEST"), \"serverNames\": [ $(json_quote "$REALITY_SNI") ], \"privateKey\": $(json_quote "$REALITY_PRIVATE"), \"shortIds\": [ $(json_quote "$REALITY_SHORTID") ] }")
             else
-                parts+=("\"realitySettings\": { \"serverName\": \"$REALITY_SNI\", \"fingerprint\": \"$REALITY_FINGERPRINT\", \"publicKey\": \"$REALITY_PUBLIC\", \"shortId\": \"$REALITY_SHORTID\" }")
+                parts+=("\"realitySettings\": { \"serverName\": $(json_quote "$REALITY_SNI"), \"fingerprint\": $(json_quote "$REALITY_FINGERPRINT"), \"publicKey\": $(json_quote "$REALITY_PUBLIC"), \"shortId\": $(json_quote "$REALITY_SHORTID") }")
             fi
             ;;
         *)
@@ -627,55 +706,50 @@ stream_json() {
     echo "${parts[*]}"
 }
 
-# Inbound settings JSON for the REMOTE (receiver).
 remote_settings() {
     case "$PROTOCOL" in
         vless)
-            local client="\"id\": \"$UUID\", \"level\": 0"
-            [ -n "$FLOW" ] && client="$client, \"flow\": \"$FLOW\""
-            echo "\"clients\": [ { $client } ], \"decryption\": \"$VLESS_DECRYPTION\""
+            local client="\"id\": $(json_quote "$UUID"), \"level\": 0"
+            [ -n "$FLOW" ] && client="$client, \"flow\": $(json_quote "$FLOW")"
+            echo "\"clients\": [ { $client } ], \"decryption\": $(json_quote "$VLESS_DECRYPTION")"
             ;;
         vmess)
-            echo "\"clients\": [ { \"id\": \"$UUID\", \"alterId\": 0 } ]"
+            echo "\"clients\": [ { \"id\": $(json_quote "$UUID"), \"alterId\": 0 } ]"
             ;;
         trojan)
-            echo "\"clients\": [ { \"password\": \"$PASSWORD\" } ]"
+            echo "\"clients\": [ { \"password\": $(json_quote "$PASSWORD") } ]"
             ;;
         shadowsocks)
-            # Without XUDP, Shadowsocks/Socks UDP uses the protocol's native path
-            # and bypasses the configured transport + security layer, so it would
-            # travel unmasked and be dropped. Restrict to TCP when camouflaged.
             local ss_net="tcp,udp"
             [[ "$SECURITY" != "none" ]] && ss_net="tcp"
-            echo "\"method\": \"$SS_METHOD\", \"password\": \"$PASSWORD\", \"network\": \"$ss_net\""
+            echo "\"method\": $(json_quote "$SS_METHOD"), \"password\": $(json_quote "$PASSWORD"), \"network\": $(json_quote "$ss_net")"
             ;;
         socks)
             local socks_udp="true"
             [[ "$SECURITY" != "none" ]] && socks_udp="false"
-            echo "\"auth\": \"password\", \"accounts\": [ { \"user\": \"tunnel\", \"pass\": \"$PASSWORD\" } ], \"udp\": $socks_udp"
+            echo "\"auth\": \"password\", \"accounts\": [ { \"user\": \"tunnel\", \"pass\": $(json_quote "$PASSWORD") } ], \"udp\": $socks_udp"
             ;;
     esac
 }
 
-# Outbound settings JSON for the LOCAL (forwarder).
 local_settings() {
     case "$PROTOCOL" in
         vless)
-            local user="\"id\": \"$UUID\", \"encryption\": \"$VLESS_ENCRYPTION\", \"level\": 0"
-            [ -n "$FLOW" ] && user="$user, \"flow\": \"$FLOW\""
-            echo "\"vnext\": [ { \"address\": \"$REMOTE_IP\", \"port\": $TUNNEL_PORT, \"users\": [ { $user } ] } ]"
+            local user="\"id\": $(json_quote "$UUID"), \"encryption\": $(json_quote "$VLESS_ENCRYPTION"), \"level\": 0"
+            [ -n "$FLOW" ] && user="$user, \"flow\": $(json_quote "$FLOW")"
+            echo "\"vnext\": [ { \"address\": $(json_quote "$REMOTE_IP"), \"port\": $TUNNEL_PORT, \"users\": [ { $user } ] } ]"
             ;;
         vmess)
-            echo "\"vnext\": [ { \"address\": \"$REMOTE_IP\", \"port\": $TUNNEL_PORT, \"users\": [ { \"id\": \"$UUID\", \"security\": \"$VMESS_SECURITY\", \"level\": 0 } ] } ]"
+            echo "\"vnext\": [ { \"address\": $(json_quote "$REMOTE_IP"), \"port\": $TUNNEL_PORT, \"users\": [ { \"id\": $(json_quote "$UUID"), \"security\": $(json_quote "$VMESS_SECURITY"), \"level\": 0 } ] } ]"
             ;;
         trojan)
-            echo "\"servers\": [ { \"address\": \"$REMOTE_IP\", \"port\": $TUNNEL_PORT, \"password\": \"$PASSWORD\" } ]"
+            echo "\"servers\": [ { \"address\": $(json_quote "$REMOTE_IP"), \"port\": $TUNNEL_PORT, \"password\": $(json_quote "$PASSWORD") } ]"
             ;;
         shadowsocks)
-            echo "\"servers\": [ { \"address\": \"$REMOTE_IP\", \"port\": $TUNNEL_PORT, \"password\": \"$PASSWORD\", \"method\": \"$SS_METHOD\" } ]"
+            echo "\"servers\": [ { \"address\": $(json_quote "$REMOTE_IP"), \"port\": $TUNNEL_PORT, \"password\": $(json_quote "$PASSWORD"), \"method\": $(json_quote "$SS_METHOD") } ]"
             ;;
         socks)
-            echo "\"servers\": [ { \"address\": \"$REMOTE_IP\", \"port\": $TUNNEL_PORT, \"users\": [ { \"user\": \"tunnel\", \"pass\": \"$PASSWORD\" } ] } ]"
+            echo "\"servers\": [ { \"address\": $(json_quote "$REMOTE_IP"), \"port\": $TUNNEL_PORT, \"users\": [ { \"user\": \"tunnel\", \"pass\": $(json_quote "$PASSWORD") } ] } ]"
             ;;
     esac
 }
@@ -734,17 +808,32 @@ HOOK
         KEY_FILE="$CONF_DIR/private.key"
         SERVER_NAME="bing.com"
         ALLOW_INSECURE="true"
-        # Keep an existing certificate: regenerating it would change the SHA-256
-        # pin and silently break the already-configured local (Iran) side.
+        # Xray certificate pinning requires a leaf certificate (CA:FALSE). Keep a
+        # compatible existing leaf to preserve its pin; migrate older CA-style
+        # self-signed certificates and print the new pin in the summary.
+        local reuse_cert=false
         if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
+            reuse_cert=true
+            if [[ "$ENGINE" == "xray" ]] && ! openssl x509 -in "$CERT_FILE" -noout -text 2>/dev/null | grep -q 'CA:FALSE'; then
+                reuse_cert=false
+                echo -e "${YELLOW}Replacing an old CA-style self-signed certificate with a TLS leaf certificate; update the local pin.${NC}"
+            fi
+        fi
+        if [ "$reuse_cert" = true ]; then
             echo -e "${GREEN}Reusing the existing self-signed certificate (keeps its pin stable).${NC}"
         else
-            echo -e "${GREEN}Generating self-signed certificates...${NC}"
+            echo -e "${GREEN}Generating a self-signed TLS leaf certificate...${NC}"
             openssl ecparam -genkey -name prime256v1 -out "$KEY_FILE" \
                 || die "Failed to generate private key"
-            openssl req -new -x509 -days 3650 -key "$KEY_FILE" -out "$CERT_FILE" -subj "/CN=$SERVER_NAME" >/dev/null 2>&1 \
+            openssl req -new -x509 -days 3650 -key "$KEY_FILE" -out "$CERT_FILE" \
+                -subj "/CN=$SERVER_NAME" \
+                -addext "basicConstraints=critical,CA:FALSE" \
+                -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+                -addext "extendedKeyUsage=serverAuth" \
+                -addext "subjectAltName=DNS:$SERVER_NAME" >/dev/null 2>&1 \
                 || die "Failed to generate self-signed certificate"
         fi
+        chmod 600 "$KEY_FILE" "$CERT_FILE" || die "Could not secure certificate files"
         CERT_SHA256=$(cert_sha256 "$CERT_FILE")
         [ -n "$CERT_SHA256" ] || die "Could not compute the certificate SHA-256 fingerprint"
     fi
@@ -754,36 +843,66 @@ HOOK
 # Config generation
 # ---------------------------------------------------------------------------
 
+json_quote() {
+    jq -Rn --arg value "$1" '$value'
+}
+
+yaml_quote() {
+    # JSON quoted scalars are valid YAML and safely preserve punctuation.
+    json_quote "$1"
+}
+
+validate_yaml_file() {
+    python3 - "$1" <<'PY'
+import sys
+import yaml
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    data = yaml.safe_load(handle)
+if not isinstance(data, dict):
+    raise SystemExit("configuration root must be a mapping")
+PY
+}
+
+install_private_config() {
+    local source="$1" destination="$2" stale="$3"
+    install -m 0600 "$source" "$destination" || {
+        rm -f -- "$source"
+        die "Failed to install validated configuration"
+    }
+    rm -f -- "$source" "$stale"
+}
+
 create_remote_hysteria() {
-    cat <<EOF > "$CONF_DIR/config.yaml"
-listen: :$TUNNEL_PORT
+    local output="$1"
+    cat <<EOF > "$output"
+listen: $(yaml_quote ":$TUNNEL_PORT")
 
 tls:
-  cert: $CERT_FILE
-  key: $KEY_FILE
+  cert: $(yaml_quote "$CERT_FILE")
+  key: $(yaml_quote "$KEY_FILE")
 
 auth:
   type: password
-  password: $PASSWORD
+  password: $(yaml_quote "$PASSWORD")
 
 obfs:
   type: salamander
   salamander:
-    password: $OBFS_PASS
+    password: $(yaml_quote "$OBFS_PASS")
 EOF
 }
 
 create_remote_config() {
+    local tmp settings stream
     if [[ "$ENGINE" == "hysteria" ]]; then
         make_certs
-        create_remote_hysteria
+        tmp=$(mktemp "$CONF_DIR/.config.XXXXXX.yaml") || die "Could not create a temporary config"
+        create_remote_hysteria "$tmp"
+        validate_yaml_file "$tmp" || { rm -f -- "$tmp"; die "Generated Hysteria YAML is invalid"; }
+        install_private_config "$tmp" "$CONF_DIR/config.yaml" "$CONF_DIR/config.json"
         return
     fi
 
-    # Security material for stream-capable protocols. Existing material is
-    # reused (important for edits: regenerating REALITY keys would break the
-    # already-configured local side). Material is (re)generated only when it is
-    # missing, or when an edit explicitly cleared it to request a refresh.
     if is_stream_protocol; then
         if [[ "$SECURITY" == "tls" ]]; then
             make_certs
@@ -796,15 +915,15 @@ create_remote_config() {
         fi
     fi
 
-    local settings stream
     settings=$(remote_settings)
     if is_stream_protocol; then
         stream=$(stream_json remote)
     else
-        stream="\"network\": \"tcp\", \"security\": \"none\""
+        stream='"network": "tcp", "security": "none"'
     fi
 
-    cat <<EOF > "$CONF_DIR/config.json"
+    tmp=$(mktemp "$CONF_DIR/.config.XXXXXX.json") || die "Could not create a temporary config"
+    cat <<EOF > "$tmp"
 {
   "log": { "loglevel": "warning" },
   "inbounds": [
@@ -820,25 +939,43 @@ create_remote_config() {
   "outbounds": [ { "protocol": "freedom", "settings": { "redirect": "127.0.0.1:0" } } ]
 }
 EOF
+    jq -e . "$tmp" >/dev/null || { rm -f -- "$tmp"; die "Generated Xray JSON is invalid"; }
+    "$CORE_DIR/xray" run -test -config "$tmp" >/dev/null 2>&1 || {
+        "$CORE_DIR/xray" run -test -config "$tmp" >&2
+        rm -f -- "$tmp"
+        die "Xray rejected the generated remote configuration"
+    }
+    install_private_config "$tmp" "$CONF_DIR/config.json" "$CONF_DIR/config.yaml"
 }
 
 create_local_hysteria() {
+    local output="$1"
     local sni="${LOCAL_SERVER_NAME:-bing.com}"
     local insecure="${LOCAL_ALLOW_INSECURE:-true}"
+    local pin="${LOCAL_PINNED_SHA:-}" pin_line=""
+    local bbr_profile="${HYSTERIA_BBR_PROFILE:-aggressive}"
+    [ -n "$pin" ] && pin_line="  pinSHA256: $(yaml_quote "$pin")"
+    [[ "$bbr_profile" == "aggressive" || "$bbr_profile" == "standard" || "$bbr_profile" == "conservative" ]] ||
+        die "Invalid Hysteria BBR profile in saved state"
 
-    cat <<EOF > "$CONF_DIR/config.yaml"
-server: $REMOTE_IP:$TUNNEL_PORT
+    cat <<EOF > "$output"
+server: $(yaml_quote "$REMOTE_IP:$TUNNEL_PORT")
 
-auth: $PASSWORD
+auth: $(yaml_quote "$PASSWORD")
 
 tls:
-  sni: $sni
+  sni: $(yaml_quote "$sni")
   insecure: $insecure
+$pin_line
 
 obfs:
   type: salamander
   salamander:
-    password: $OBFS_PASS
+    password: $(yaml_quote "$OBFS_PASS")
+
+congestion:
+  type: bbr
+  bbrProfile: $(yaml_quote "$bbr_profile")
 
 tcpForwarding:
 EOF
@@ -847,45 +984,63 @@ EOF
     for port in "${PORT_ARRAY[@]}"; do
         port=$(echo "$port" | tr -d ' ')
         [ -z "$port" ] && continue
+        [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || {
+            rm -f -- "$output"
+            die "Invalid forward port: $port"
+        }
         check_port "$port"
-        cat <<EOF >> "$CONF_DIR/config.yaml"
-  - listen: 0.0.0.0:$port
-    remote: 127.0.0.1:$port
+        cat <<EOF >> "$output"
+  - listen: $(yaml_quote "0.0.0.0:$port")
+    remote: $(yaml_quote "127.0.0.1:$port")
 EOF
     done
 
-    echo "" >> "$CONF_DIR/config.yaml"
-    echo "udpForwarding:" >> "$CONF_DIR/config.yaml"
+    echo "" >> "$output"
+    echo "udpForwarding:" >> "$output"
     for port in "${PORT_ARRAY[@]}"; do
         port=$(echo "$port" | tr -d ' ')
         [ -z "$port" ] && continue
-        cat <<EOF >> "$CONF_DIR/config.yaml"
-  - listen: 0.0.0.0:$port
-    remote: 127.0.0.1:$port
+        cat <<EOF >> "$output"
+  - listen: $(yaml_quote "0.0.0.0:$port")
+    remote: $(yaml_quote "127.0.0.1:$port")
 EOF
     done
 }
 
 create_local_config() {
-    # All interactive input (forward ports + client-side security material) has
-    # already been collected by the step-based flow before install; here we only
-    # write the configuration.
+    local tmp settings stream local_udp=true
+
+    if [[ "$ENGINE" == "xray" ]]; then
+        configure_xray_bbr
+    else
+        remove_xray_bbr
+    fi
+
+    if [ -n "$LOCAL_PINNED_SHA" ]; then
+        LOCAL_PINNED_SHA=$(normalize_cert_pin "$LOCAL_PINNED_SHA") ||
+            die "Invalid SHA256 certificate pin in saved state"
+    fi
+
     if [[ "$ENGINE" == "hysteria" ]]; then
-        create_local_hysteria
+        tmp=$(mktemp "$CONF_DIR/.config.XXXXXX.yaml") || die "Could not create a temporary config"
+        create_local_hysteria "$tmp"
+        validate_yaml_file "$tmp" || { rm -f -- "$tmp"; die "Generated Hysteria YAML is invalid"; }
+        install_private_config "$tmp" "$CONF_DIR/config.yaml" "$CONF_DIR/config.json"
         return
     fi
 
-    local settings stream
     settings=$(local_settings)
     if is_stream_protocol; then
         stream=$(stream_json local)
     else
-        stream="\"network\": \"tcp\", \"security\": \"none\""
+        stream='"network": "tcp", "security": "none"'
+    fi
+    if [[ "$SECURITY" != "none" && ( "$PROTOCOL" == "shadowsocks" || "$PROTOCOL" == "socks" ) ]]; then
+        local_udp=false
     fi
 
-    # A local-only SOCKS inbound is the entry point that tun2socks feeds; its
-    # traffic flows out through the encrypted tunnel outbound below.
-    cat <<EOF > "$CONF_DIR/config.json"
+    tmp=$(mktemp "$CONF_DIR/.config.XXXXXX.json") || die "Could not create a temporary config"
+    cat <<EOF > "$tmp"
 {
   "log": { "loglevel": "warning" },
   "inbounds": [
@@ -894,7 +1049,7 @@ create_local_config() {
       "listen": "127.0.0.1",
       "port": $SOCKS_PORT,
       "protocol": "socks",
-      "settings": { "auth": "noauth", "udp": true },
+      "settings": { "auth": "noauth", "udp": $local_udp },
       "sniffing": { "enabled": false }
     }
   ],
@@ -907,6 +1062,13 @@ create_local_config() {
   ]
 }
 EOF
+    jq -e . "$tmp" >/dev/null || { rm -f -- "$tmp"; die "Generated Xray JSON is invalid"; }
+    "$CORE_DIR/xray" run -test -config "$tmp" >/dev/null 2>&1 || {
+        "$CORE_DIR/xray" run -test -config "$tmp" >&2
+        rm -f -- "$tmp"
+        die "Xray rejected the generated local configuration"
+    }
+    install_private_config "$tmp" "$CONF_DIR/config.json" "$CONF_DIR/config.yaml"
 
     install_tun2socks
     write_forward_scripts
@@ -915,28 +1077,43 @@ EOF
 # Generate the up/down scripts that build the TUN device + iptables rules so the
 # chosen ports are forwarded through the tunnel (system-level, no dokodemo-door).
 write_forward_scripts() {
-    local ports_line=""
+    local ports_line="" udp_enabled=true
     IFS=',' read -ra PORT_ARRAY <<< "$FORWARD_PORTS"
     for port in "${PORT_ARRAY[@]}"; do
         port=$(echo "$port" | tr -d ' ')
         [ -z "$port" ] && continue
-        [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] \
-            || die "Invalid forward port: $port"
+        [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || die "Invalid forward port: $port"
         check_port "$port"
         ports_line="$ports_line $port"
     done
     ports_line="${ports_line# }"
     [ -n "$ports_line" ] || die "No valid forward ports provided"
+    if [[ "$SECURITY" != "none" && ( "$PROTOCOL" == "shadowsocks" || "$PROTOCOL" == "socks" ) ]]; then
+        udp_enabled=false
+    fi
 
     cat <<EOF > "$CONF_DIR/forward-up.sh"
 #!/bin/bash
 # Auto-generated by Wild Tunnel installer. Brings up the forwarding TUN + rules.
+set -euo pipefail
 TUN="$TUN_NAME"
 TUN_CIDR_ADDR="$TUN_ADDR/$TUN_CIDR"
+TUN_MTU="$TUN_MTU"
+TUN_TXQLEN="$TUN_TXQLEN"
 SENTINEL="$SENTINEL_IP"
 PORTS=($ports_line)
+ENABLE_UDP=$udp_enabled
+SYSCTL_STATE="$CONF_DIR/forward-sysctl.state"
 EOF
     cat <<'EOF' >> "$CONF_DIR/forward-up.sh"
+if [ ! -f "$SYSCTL_STATE" ]; then
+    {
+        sysctl -n net.ipv4.ip_forward
+        sysctl -n net.ipv4.conf.all.rp_filter
+        sysctl -n net.ipv4.conf.default.rp_filter
+    } > "$SYSCTL_STATE"
+    chmod 600 "$SYSCTL_STATE"
+fi
 sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
 sysctl -w net.ipv4.conf.all.rp_filter=0 >/dev/null 2>&1
 sysctl -w net.ipv4.conf.default.rp_filter=0 >/dev/null 2>&1
@@ -945,19 +1122,22 @@ if ! ip link show "$TUN" >/dev/null 2>&1; then
     ip tuntap add mode tun dev "$TUN"
 fi
 ip addr replace "$TUN_CIDR_ADDR" dev "$TUN"
-ip link set dev "$TUN" up
+ip link set dev "$TUN" mtu "$TUN_MTU" txqueuelen "$TUN_TXQLEN" up
 
 ensure() { local t="$1" c="$2"; shift 2; iptables -t "$t" -C "$c" "$@" 2>/dev/null || iptables -t "$t" -A "$c" "$@"; }
 
 for p in "${PORTS[@]}"; do
     ensure nat PREROUTING -p tcp --dport "$p" -j DNAT --to-destination "$SENTINEL:$p" -m comment --comment wild-tunnel
-    ensure nat PREROUTING -p udp --dport "$p" -j DNAT --to-destination "$SENTINEL:$p" -m comment --comment wild-tunnel
+    ensure filter FORWARD -o "$TUN" -d "$SENTINEL" -p tcp --dport "$p" -j ACCEPT -m comment --comment wild-tunnel
+    if [ "$ENABLE_UDP" = true ]; then
+        ensure nat PREROUTING -p udp --dport "$p" -j DNAT --to-destination "$SENTINEL:$p" -m comment --comment wild-tunnel
+        ensure filter FORWARD -o "$TUN" -d "$SENTINEL" -p udp --dport "$p" -j ACCEPT -m comment --comment wild-tunnel
+    fi
 done
 ensure nat POSTROUTING -o "$TUN" -j MASQUERADE -m comment --comment wild-tunnel
-ensure filter FORWARD -o "$TUN" -j ACCEPT -m comment --comment wild-tunnel
-ensure filter FORWARD -i "$TUN" -j ACCEPT -m comment --comment wild-tunnel
+ensure filter FORWARD -i "$TUN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT -m comment --comment wild-tunnel
 EOF
-    chmod +x "$CONF_DIR/forward-up.sh"
+    chmod 700 "$CONF_DIR/forward-up.sh"
 
     cat <<EOF > "$CONF_DIR/forward-down.sh"
 #!/bin/bash
@@ -965,35 +1145,72 @@ EOF
 TUN="$TUN_NAME"
 SENTINEL="$SENTINEL_IP"
 PORTS=($ports_line)
+ENABLE_UDP=$udp_enabled
+SYSCTL_STATE="$CONF_DIR/forward-sysctl.state"
 EOF
     cat <<'EOF' >> "$CONF_DIR/forward-down.sh"
 for p in "${PORTS[@]}"; do
     iptables -t nat -D PREROUTING -p tcp --dport "$p" -j DNAT --to-destination "$SENTINEL:$p" -m comment --comment wild-tunnel 2>/dev/null
-    iptables -t nat -D PREROUTING -p udp --dport "$p" -j DNAT --to-destination "$SENTINEL:$p" -m comment --comment wild-tunnel 2>/dev/null
+    iptables -D FORWARD -o "$TUN" -d "$SENTINEL" -p tcp --dport "$p" -j ACCEPT -m comment --comment wild-tunnel 2>/dev/null
+    if [ "$ENABLE_UDP" = true ]; then
+        iptables -t nat -D PREROUTING -p udp --dport "$p" -j DNAT --to-destination "$SENTINEL:$p" -m comment --comment wild-tunnel 2>/dev/null
+        iptables -D FORWARD -o "$TUN" -d "$SENTINEL" -p udp --dport "$p" -j ACCEPT -m comment --comment wild-tunnel 2>/dev/null
+    fi
 done
 iptables -t nat -D POSTROUTING -o "$TUN" -j MASQUERADE -m comment --comment wild-tunnel 2>/dev/null
+iptables -D FORWARD -i "$TUN" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT -m comment --comment wild-tunnel 2>/dev/null
+# Remove broad rules left by releases before the scoped-rule migration.
 iptables -D FORWARD -o "$TUN" -j ACCEPT -m comment --comment wild-tunnel 2>/dev/null
 iptables -D FORWARD -i "$TUN" -j ACCEPT -m comment --comment wild-tunnel 2>/dev/null
 ip link set dev "$TUN" down 2>/dev/null
 ip link del "$TUN" 2>/dev/null
+
+if [ -f "$SYSCTL_STATE" ]; then
+    old_forward=$(sed -n '1p' "$SYSCTL_STATE")
+    old_all_rp=$(sed -n '2p' "$SYSCTL_STATE")
+    old_default_rp=$(sed -n '3p' "$SYSCTL_STATE")
+    [[ "$old_forward" =~ ^[0-9]+$ ]] && sysctl -w "net.ipv4.ip_forward=$old_forward" >/dev/null 2>&1
+    [[ "$old_all_rp" =~ ^[0-9]+$ ]] && sysctl -w "net.ipv4.conf.all.rp_filter=$old_all_rp" >/dev/null 2>&1
+    [[ "$old_default_rp" =~ ^[0-9]+$ ]] && sysctl -w "net.ipv4.conf.default.rp_filter=$old_default_rp" >/dev/null 2>&1
+    rm -f -- "$SYSCTL_STATE"
+fi
 EOF
-    chmod +x "$CONF_DIR/forward-down.sh"
+    chmod 700 "$CONF_DIR/forward-down.sh"
 }
 
-# Install + start the tun2socks service that pumps the TUN device into the SOCKS
-# inbound (which is chained to the encrypted tunnel outbound).
+stop_forward_runtime() {
+    systemctl stop "$FWD_SERVICE" 2>/dev/null || true
+    [ -f "$CONF_DIR/forward-down.sh" ] && bash "$CONF_DIR/forward-down.sh" 2>/dev/null || true
+}
+
+remove_forward_service() {
+    stop_forward_runtime
+    systemctl disable "$FWD_SERVICE" 2>/dev/null || true
+    rm -f -- /etc/systemd/system/${FWD_SERVICE}.service
+    rm -f -- "$CONF_DIR/forward-up.sh" "$CONF_DIR/forward-down.sh" "$CONF_DIR/forward-sysctl.state"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
 setup_forward_service() {
     echo -e "${GREEN}Setting up port-forwarding service (${FWD_SERVICE})...${NC}"
-    cat <<EOF > /etc/systemd/system/${FWD_SERVICE}.service
+    local unit_tmp
+    unit_tmp=$(mktemp) || die "Could not create a temporary forwarding unit"
+    cat <<EOF > "$unit_tmp"
 [Unit]
 Description=Wild Tunnel Port Forwarder
-After=network.target ${SERVICE}.service
+Wants=network-online.target
+After=network-online.target ${SERVICE}.service
 Requires=${SERVICE}.service
 
 [Service]
 Type=simple
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=$CONF_DIR
+UMask=0077
 ExecStartPre=/bin/bash $CONF_DIR/forward-up.sh
-ExecStart=$CORE_DIR/tun2socks --device $TUN_NAME --proxy socks5://127.0.0.1:$SOCKS_PORT --loglevel warning
+ExecStart=$CORE_DIR/tun2socks --device $TUN_NAME --mtu $TUN_MTU --proxy socks5://127.0.0.1:$SOCKS_PORT --tcp-rcvbuf $TUN_TCP_RCVBUF --tcp-auto-tuning --loglevel warning
 ExecStopPost=/bin/bash $CONF_DIR/forward-down.sh
 Restart=on-failure
 RestartSec=3
@@ -1001,9 +1218,17 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable "$FWD_SERVICE"
-    systemctl restart "$FWD_SERVICE"
+    install -m 0644 "$unit_tmp" /etc/systemd/system/${FWD_SERVICE}.service || {
+        rm -f -- "$unit_tmp"
+        die "Failed to install forwarding systemd unit"
+    }
+    rm -f -- "$unit_tmp"
+    systemctl daemon-reload || die "systemd daemon-reload failed"
+    systemctl enable "$FWD_SERVICE" || die "Could not enable $FWD_SERVICE"
+    if ! systemctl restart "$FWD_SERVICE" || ! systemctl is-active --quiet "$FWD_SERVICE"; then
+        journalctl -u "$FWD_SERVICE" -n 30 --no-pager >&2
+        die "$FWD_SERVICE failed to start"
+    fi
     echo -e "${GREEN}Port forwarder started.${NC}"
     systemctl status "$FWD_SERVICE" --no-pager | head -n 10
 }
@@ -1031,7 +1256,14 @@ print_remote_summary() {
         echo "REALITY Public Key: $REALITY_PUBLIC"
         echo "REALITY shortId: $REALITY_SHORTID"
     }
-    if [[ "$SECURITY" == "tls" ]]; then
+    if [[ "$ENGINE" == "hysteria" ]]; then
+        if [[ "$ALLOW_INSECURE" == "false" ]]; then
+            echo "Domain/SNI: $SERVER_NAME"
+        else
+            echo "TLS SNI: $SERVER_NAME"
+            echo "TLS cert SHA256 pin: $CERT_SHA256"
+        fi
+    elif [[ "$SECURITY" == "tls" ]]; then
         if [[ "$ALLOW_INSECURE" == "false" ]]; then
             echo "Domain/SNI: $SERVER_NAME"
         else
@@ -1058,61 +1290,49 @@ reset_state() {
     USE_REAL_SSL=""; DOMAIN=""; LOCAL_SERVER_NAME=""; LOCAL_ALLOW_INSECURE="true"
     CERT_FILE=""; KEY_FILE=""; SERVER_NAME=""; ALLOW_INSECURE=""
     CERT_SHA256=""; LOCAL_PINNED_SHA=""
-    FORWARD_PORTS=""; REMOTE_IP=""; TUNNEL_PORT=""
+    FORWARD_PORTS=""; REMOTE_IP=""; TUNNEL_PORT=""; HYSTERIA_BBR_PROFILE="aggressive"
 }
 
 # Persist every selection so the configuration can be edited later. This is the
 # single source of truth the "Edit Configuration" menu reads from.
 save_state() {
+    local tmp var
+    local -a state_vars=(
+        ROLE ENGINE PROTOCOL TUNNEL_PORT REMOTE_IP UUID PASSWORD OBFS_PASS
+        SS_METHOD VMESS_SECURITY NETWORK WS_PATH HTTP_HOST GRPC_SERVICE HTTP_PATH
+        SECURITY FLOW VLESS_ENC VLESS_ENCRYPTION VLESS_DECRYPTION
+        REALITY_DEST REALITY_SNI REALITY_PUBLIC REALITY_PRIVATE REALITY_SHORTID
+        REALITY_FINGERPRINT USE_REAL_SSL DOMAIN CERT_FILE KEY_FILE SERVER_NAME
+        ALLOW_INSECURE CERT_SHA256 LOCAL_SERVER_NAME LOCAL_ALLOW_INSECURE
+        LOCAL_PINNED_SHA FORWARD_PORTS HYSTERIA_BBR_PROFILE
+    )
     mkdir -p "$CONF_DIR"
-    cat > "$CONF_DIR/wild.conf" <<EOF
-ROLE="$ROLE"
-ENGINE="$ENGINE"
-PROTOCOL="$PROTOCOL"
-TUNNEL_PORT="$TUNNEL_PORT"
-REMOTE_IP="$REMOTE_IP"
-UUID="$UUID"
-PASSWORD="$PASSWORD"
-OBFS_PASS="$OBFS_PASS"
-SS_METHOD="$SS_METHOD"
-VMESS_SECURITY="$VMESS_SECURITY"
-NETWORK="$NETWORK"
-WS_PATH="$WS_PATH"
-HTTP_HOST="$HTTP_HOST"
-GRPC_SERVICE="$GRPC_SERVICE"
-HTTP_PATH="$HTTP_PATH"
-SECURITY="$SECURITY"
-FLOW="$FLOW"
-VLESS_ENC="$VLESS_ENC"
-VLESS_ENCRYPTION="$VLESS_ENCRYPTION"
-VLESS_DECRYPTION="$VLESS_DECRYPTION"
-REALITY_DEST="$REALITY_DEST"
-REALITY_SNI="$REALITY_SNI"
-REALITY_PUBLIC="$REALITY_PUBLIC"
-REALITY_PRIVATE="$REALITY_PRIVATE"
-REALITY_SHORTID="$REALITY_SHORTID"
-REALITY_FINGERPRINT="$REALITY_FINGERPRINT"
-USE_REAL_SSL="$USE_REAL_SSL"
-DOMAIN="$DOMAIN"
-CERT_FILE="$CERT_FILE"
-KEY_FILE="$KEY_FILE"
-SERVER_NAME="$SERVER_NAME"
-ALLOW_INSECURE="$ALLOW_INSECURE"
-CERT_SHA256="$CERT_SHA256"
-LOCAL_SERVER_NAME="$LOCAL_SERVER_NAME"
-LOCAL_ALLOW_INSECURE="$LOCAL_ALLOW_INSECURE"
-LOCAL_PINNED_SHA="$LOCAL_PINNED_SHA"
-FORWARD_PORTS="$FORWARD_PORTS"
-EOF
-    chmod 600 "$CONF_DIR/wild.conf" 2>/dev/null || true
+    chmod 700 "$CONF_DIR"
+    tmp=$(mktemp "$CONF_DIR/.wild.conf.XXXXXX") || die "Could not create temporary state"
+    {
+        for var in "${state_vars[@]}"; do
+            # %q emits a Bash-safe assignment value without re-evaluating user
+            # supplied dollar signs, quotes, backticks or command substitutions.
+            printf '%s=%q\n' "$var" "${!var}"
+        done
+    } > "$tmp"
+    install -m 0600 "$tmp" "$CONF_DIR/wild.conf" || {
+        rm -f -- "$tmp"
+        die "Could not save configuration state"
+    }
+    rm -f -- "$tmp"
 }
 
-# Load a previously saved configuration into the current shell. Returns 1 when
-# no saved state exists (e.g. installed with an older version, or not installed).
+# Load a previously saved configuration into the current shell. The file is
+# generated with printf %q, owned by root and private before it is sourced.
 load_state() {
-    [ -f "$CONF_DIR/wild.conf" ] || return 1
+    local state="$CONF_DIR/wild.conf"
+    [ -f "$state" ] || return 1
+    [ ! -L "$state" ] || die "Refusing to load symlinked state file"
+    [[ $(stat -c '%u' "$state" 2>/dev/null) == "0" ]] || die "State file must be owned by root"
+    chmod 600 "$state" || die "Could not secure state file"
     # shellcheck disable=SC1090
-    . "$CONF_DIR/wild.conf"
+    . "$state"
     return 0
 }
 
@@ -1229,12 +1449,14 @@ prompt_remote_domain() {
     else
         LOCAL_SERVER_NAME="bing.com"
         LOCAL_ALLOW_INSECURE="true"
-        # Hysteria trusts a self-signed cert via its own "insecure" flag; Xray
-        # needs the fingerprint the remote printed in its summary.
-        if [[ "$ENGINE" != "hysteria" ]]; then
+        while true; do
             read -p "Enter TLS cert SHA256 pin (from the remote summary) (0=Back): " LOCAL_PINNED_SHA
             [ "$LOCAL_PINNED_SHA" = "0" ] && return $BACK_RC
-        fi
+            if LOCAL_PINNED_SHA=$(normalize_cert_pin "$LOCAL_PINNED_SHA"); then
+                break
+            fi
+            echo -e "${RED}Invalid SHA256 certificate pin; enter exactly 64 hex digits (colons are optional).${NC}"
+        done
     fi
     return 0
 }
@@ -1301,6 +1523,9 @@ do_remote_setup() {
     fi
     check_port "$TUNNEL_PORT"
     install_core
+    # A previous local/Xray installation may have left a TUN forwarder behind.
+    remove_forward_service
+    remove_xray_bbr
     create_remote_config
     setup_service
     save_state
@@ -1324,6 +1549,12 @@ do_local_setup() {
         return 1
     fi
     install_core
+    if [[ "$ENGINE" == "xray" ]]; then
+        # Tear down rules using the old script before it is regenerated.
+        stop_forward_runtime
+    else
+        remove_forward_service
+    fi
     create_local_config
     setup_service
     [[ "$ENGINE" == "xray" ]] && setup_forward_service
@@ -1422,7 +1653,7 @@ edit_client_reality() {
 }
 
 edit_remote_domain_local() {
-    local ans
+    local ans candidate
     read -p "Does the Remote use a REAL Domain for TLS? (y/n) [current insecure=$LOCAL_ALLOW_INSECURE] (0=cancel): " ans
     [ "$ans" = "0" ] && return 1
     if [[ "$ans" == "y" || "$ans" == "Y" ]]; then
@@ -1431,15 +1662,34 @@ edit_remote_domain_local() {
     elif [[ "$ans" == "n" || "$ans" == "N" ]]; then
         LOCAL_SERVER_NAME="bing.com"; LOCAL_ALLOW_INSECURE="true"
     fi
-    # Self-signed remotes are trusted by fingerprint (Xray v26 has no
-    # allowInsecure); let it be corrected whenever the remote's cert changes.
-    if [[ "$LOCAL_ALLOW_INSECURE" == "true" && "$ENGINE" != "hysteria" ]]; then
-        edit_field LOCAL_PINNED_SHA "TLS cert SHA256 pin (from remote)" || return 1
+    if [[ "$LOCAL_ALLOW_INSECURE" == "true" ]]; then
+        while true; do
+            read -p "TLS cert SHA256 pin (from remote) (0=cancel): " candidate
+            [ "$candidate" = "0" ] && return 1
+            if LOCAL_PINNED_SHA=$(normalize_cert_pin "$candidate"); then
+                break
+            fi
+            echo -e "${RED}Invalid SHA256 certificate pin; enter exactly 64 hex digits (colons are optional).${NC}"
+        done
     fi
     return 0
 }
 
 edit_vless_enc_string() { edit_field VLESS_ENCRYPTION "VLESS Encryption string (from remote)"; }
+
+edit_hysteria_bbr_profile() {
+    echo "Hysteria client BBR profile (controls this server's upload):"
+    echo "1) aggressive (higher throughput, more loss-sensitive)"
+    echo "2) standard (balanced)"
+    echo "3) conservative"
+    read -p "Choice [1-3]: " profile_choice
+    case "$profile_choice" in
+        1) HYSTERIA_BBR_PROFILE="aggressive" ;;
+        2) HYSTERIA_BBR_PROFILE="standard" ;;
+        3) HYSTERIA_BBR_PROFILE="conservative" ;;
+        *) echo -e "${RED}Invalid profile.${NC}"; return 1 ;;
+    esac
+}
 
 show_config_brief() {
     echo -e "${YELLOW}Current:  role=$ROLE  protocol=$PROTOCOL  port=$TUNNEL_PORT  security=${SECURITY:-none}  network=${NETWORK:-tcp}${NC}"
@@ -1450,6 +1700,8 @@ show_config_brief() {
 apply_remote() {
     echo -e "${GREEN}Applying changes on the Foreign (remote) server...${NC}"
     ensure_core
+    remove_forward_service
+    remove_xray_bbr
     create_remote_config
     setup_service
     save_state
@@ -1459,15 +1711,14 @@ apply_remote() {
 apply_local() {
     echo -e "${GREEN}Applying changes on the Iran (local) server...${NC}"
     ensure_core
+    if [[ "$ENGINE" == "xray" ]]; then
+        stop_forward_runtime
+    else
+        remove_forward_service
+    fi
     create_local_config
     setup_service
-    if [[ "$ENGINE" == "xray" ]]; then
-        setup_forward_service
-    else
-        systemctl stop "$FWD_SERVICE" 2>/dev/null
-        systemctl disable "$FWD_SERVICE" 2>/dev/null
-        [ -f "$CONF_DIR/forward-down.sh" ] && bash "$CONF_DIR/forward-down.sh" 2>/dev/null
-    fi
+    [[ "$ENGINE" == "xray" ]] && setup_forward_service
     save_state
     echo -e "${GREEN}Local configuration updated.${NC}"
 }
@@ -1531,6 +1782,7 @@ edit_local() {
         { [[ "$SECURITY" == "tls" ]] || [[ "$ENGINE" == "hysteria" ]]; } && echo "8) Remote TLS domain"
         [[ "$PROTOCOL" == "vless" && "$VLESS_ENC" == "on" ]] && echo "9) VLESS Encryption string"
         echo "10) Forward Ports"
+        [[ "$ENGINE" == "hysteria" ]] && echo "11) Hysteria upload profile [current: $HYSTERIA_BBR_PROFILE]"
         echo -e "${GREEN}a) Apply changes (regenerate config + restart)${NC}"
         echo "0) Back to main menu"
         read -p "Select: " e
@@ -1545,6 +1797,7 @@ edit_local() {
             8) if [[ "$SECURITY" == "tls" || "$ENGINE" == "hysteria" ]]; then edit_remote_domain_local && dirty=1; else echo -e "${RED}Not applicable.${NC}"; fi ;;
             9) if [[ "$PROTOCOL" == "vless" && "$VLESS_ENC" == "on" ]]; then edit_vless_enc_string && dirty=1; else echo -e "${RED}Not applicable.${NC}"; fi ;;
             10) edit_forward_ports && dirty=1 ;;
+            11) if [[ "$ENGINE" == "hysteria" ]]; then edit_hysteria_bbr_profile && dirty=1; else echo -e "${RED}Not applicable.${NC}"; fi ;;
             a|A) apply_local; dirty=0 ;;
             0) confirm_discard "$dirty" && return ;;
             *) echo -e "${RED}Invalid option.${NC}" ;;
@@ -1567,19 +1820,24 @@ do_edit() {
 }
 
 do_uninstall() {
+    local confirmation
+    read -p "Type UNINSTALL to remove Wild Tunnel and its local configuration: " confirmation
+    if [ "$confirmation" != "UNINSTALL" ]; then
+        echo -e "${YELLOW}Uninstall cancelled.${NC}"
+        return 1
+    fi
     echo -e "${RED}Uninstalling Wild Tunnel...${NC}"
-    systemctl stop "$FWD_SERVICE" 2>/dev/null
-    systemctl disable "$FWD_SERVICE" 2>/dev/null
-    [ -f "$CONF_DIR/forward-down.sh" ] && bash "$CONF_DIR/forward-down.sh" 2>/dev/null
-    rm -f /etc/systemd/system/${FWD_SERVICE}.service
+    remove_forward_service
+    remove_xray_bbr
     systemctl stop "$SERVICE" 2>/dev/null
     systemctl disable "$SERVICE" 2>/dev/null
-    crontab -l 2>/dev/null | grep -v '# wild-tunnel-restart' | crontab - 2>/dev/null
+    remove_cron 2>/dev/null || true
     rm -f /etc/systemd/system/${SERVICE}.service
     rm -f /etc/letsencrypt/renewal-hooks/deploy/wild-tunnel.sh
     rm -rf "$CORE_DIR"
     rm -rf "$CONF_DIR"
     rm -f /usr/local/bin/wild
+    rm -rf /usr/local/lib/wild-tunnel
     systemctl daemon-reload
     systemctl reset-failed "$SERVICE" 2>/dev/null
     systemctl reset-failed "$FWD_SERVICE" 2>/dev/null
@@ -1605,6 +1863,22 @@ svc_logs() {
     journalctl -u "$SERVICE" -f
 }
 
+restart_services() {
+    if ! systemctl restart "$SERVICE" || ! systemctl is-active --quiet "$SERVICE"; then
+        echo -e "${RED}Tunnel restart failed.${NC}"
+        journalctl -u "$SERVICE" -n 20 --no-pager
+        return 1
+    fi
+    if has_forward; then
+        systemctl restart "$FWD_SERVICE" && systemctl is-active --quiet "$FWD_SERVICE" || {
+            echo -e "${RED}Forwarder restart failed.${NC}"
+            journalctl -u "$FWD_SERVICE" -n 20 --no-pager
+            return 1
+        }
+    fi
+    echo -e "${GREEN}Restarted.${NC}"
+}
+
 show_full_config() {
     [ -f "$CONF_DIR/config.json" ] && { echo -e "${GREEN}--- config.json ---${NC}"; cat "$CONF_DIR/config.json"; echo; }
     [ -f "$CONF_DIR/config.yaml" ] && { echo -e "${GREEN}--- config.yaml ---${NC}"; cat "$CONF_DIR/config.yaml"; echo; }
@@ -1622,20 +1896,24 @@ post_install_menu() {
         echo "5) Live logs (Ctrl+C to exit)"
         echo "6) Show config"
         echo "7) Edit Configuration"
-        echo "8) Uninstall"
-        echo "9) Back to main menu"
+        echo "8) Schedule auto-restart"
+        echo "9) Remove scheduled restart"
+        echo "10) Uninstall"
+        echo "11) Back to main menu"
         echo "0) Exit"
-        read -p "Select an option [0-9]: " opt
+        read -p "Select an option [0-11]: " opt
         case "$opt" in
             1) svc_status ;;
-            2) systemctl restart "$SERVICE"; has_forward && systemctl restart "$FWD_SERVICE"; echo -e "${GREEN}Restarted.${NC}" ;;
+            2) restart_services ;;
             3) systemctl stop "$SERVICE"; has_forward && systemctl stop "$FWD_SERVICE"; echo -e "${YELLOW}Stopped.${NC}" ;;
             4) systemctl start "$SERVICE"; has_forward && systemctl start "$FWD_SERVICE"; echo -e "${GREEN}Started.${NC}" ;;
             5) svc_logs ;;
             6) show_full_config ;;
             7) do_edit ;;
-            8) do_uninstall; pause_enter; return ;;
-            9) return ;;
+            8) schedule_restart ;;
+            9) remove_cron && echo -e "${GREEN}Scheduled restart removed.${NC}" ;;
+            10) do_uninstall; pause_enter; return ;;
+            11) return ;;
             0) echo -e "${GREEN}Goodbye!${NC}"; exit 0 ;;
             *) echo -e "${RED}Invalid option.${NC}" ;;
         esac

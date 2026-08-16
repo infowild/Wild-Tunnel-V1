@@ -9,7 +9,7 @@ transport protocols powered by two cores:
 - **Xray-core** — `VLESS`, `VMESS`, `Trojan`, `Shadowsocks`, `SOCKS`
 - **Hysteria2** (`apernet/hysteria`) — native UDP transport with Salamander obfuscation
 
-Both TCP and UDP traffic on the selected ports are relayed through the tunnel.
+TCP and UDP are relayed on the selected ports, except when Shadowsocks or SOCKS uses TLS/REALITY: in that mode UDP is deliberately disabled because Xray would send native UDP outside the camouflage layer.
 
 ---
 
@@ -24,25 +24,21 @@ Both TCP and UDP traffic on the selected ports are relayed through the tunnel.
  └──────────────┘                            └──────────────┘
    listens on                                  terminates the tunnel and
    your chosen ports                           connects to 127.0.0.1:<port>
-   (dokodemo-door / port-forwarding)           on its own side
+   (TUN/tun2socks or native forwarding)           on its own side
 ```
 
 - **Remote server (Receiver):** terminates the tunnel and forwards traffic to
   `127.0.0.1:<port>` on itself (via Xray `freedom` outbound, or Hysteria2's built-in
   proxy). This is where your panel/service actually listens.
-- **Local server (Forwarder):** opens the chosen ports and pushes everything that
-  arrives into the tunnel. For Xray this uses `dokodemo-door` inbounds; for Hysteria2
-  it uses native `tcpForwarding` / `udpForwarding`.
+- **Local server (Forwarder):** opens the chosen ports and pushes incoming traffic into the tunnel. Hysteria2 uses native `tcpForwarding` / `udpForwarding`. Xray uses scoped iptables rules, a dedicated TUN device, and the pinned `tun2socks` helper feeding a loopback-only SOCKS inbound.
 
-The service runs as a single systemd unit named `wild-tunnel`. The unit file is
-generated at install time based on the selected core and role, so the installer does
-not depend on being run from any particular directory.
+The tunnel core runs as `wild-tunnel`. A local Xray forwarder also runs `wild-forward` to manage the TUN device and scoped firewall rules. Both systemd units are generated at install time and hardened with private temporary storage, a read-only system filesystem, and a restrictive umask.
 
 ---
 
 ## Requirements
 
-- Ubuntu / Debian with `systemd`
+- Ubuntu / Debian on **x86_64/amd64** with `systemd`
 - `root` access (run with `sudo` or as root)
 - Two servers (one abroad, one local)
 - For a **real** TLS certificate: a domain pointing at the remote server and TCP
@@ -50,14 +46,12 @@ not depend on being run from any particular directory.
 
 Before doing anything else, the installer updates the package lists and installs
 all prerequisites it needs (`unzip`, `jq`, `openssl`, `uuid-runtime`, `wget`,
-`curl`, `iproute2`, `cron`, and `certbot` on demand).
+`iproute2`, `iptables`, `cron`, `python3`, `python3-yaml`, and `certbot` on demand).
 
 **No conflict with the Sanaei / 3x-ui panel.** Everything is namespaced
 (`wild-tunnel` service, `/usr/local/bin/wild-xray`, `/etc/wild-tunnel`, `wild`
 command), so it never touches the panel's `x-ui` service, `/usr/local/x-ui`,
-`/etc/x-ui` or `/usr/bin/x-ui`. The only possible clash is a port already used by
-the panel (default `2053`) or another service — the installer checks with `ss` and
-warns before binding.
+`/etc/x-ui` or `/usr/bin/x-ui`. It does not modify the panel's files or services. A selected listen port can still clash with another process, and a local Xray installation necessarily adds narrowly scoped iptables rules while it runs; existing sysctl values are saved and restored when that forwarder stops or is removed.
 
 ---
 
@@ -102,8 +96,7 @@ Choose option **1**, then:
 2. Pick a **protocol** (1–6).
 3. Provide/auto-generate the credentials (UUID or password, plus obfuscation
    password for Hysteria2).
-4. For `Trojan` / `Hysteria2`, choose between a **real Let's Encrypt certificate**
-   (needs a domain) or an auto-generated **self-signed** certificate.
+4. When TLS is selected (or when using Hysteria2), choose between a **real Let's Encrypt certificate** (needs a domain) or an auto-generated **self-signed** certificate.
 
 At the end the installer prints all the details (port, protocol, UUID/password,
 obfuscation password, SNI). **Save them** — you need them for the local server.
@@ -115,8 +108,7 @@ Choose option **2**, then:
 1. Enter the **Remote Server IP**.
 2. Enter the **same Tunnel Port** and **same protocol/credentials** as the remote.
 3. Enter the **ports to tunnel** (comma-separated, e.g. `2053,8443`).
-4. For `Trojan` / `Hysteria2`, state whether the remote uses a real domain (for the
-   correct SNI / certificate validation).
+4. For TLS/Hysteria2, enter the remote domain or the SHA-256 certificate pin printed by the remote installer. Self-signed connections are never accepted without a pin.
 
 Once finished, connecting to `LOCAL_IP:<port>` reaches `127.0.0.1:<port>` on the
 remote server through the tunnel.
@@ -127,11 +119,11 @@ remote server through the tunnel.
 
 | # | Protocol     | Core       | Transport | TLS                         |
 |---|--------------|------------|-----------|-----------------------------|
-| 1 | VLESS        | Xray-core  | TCP       | none                        |
-| 2 | VMESS        | Xray-core  | TCP       | none                        |
-| 3 | Trojan       | Xray-core  | TCP       | TLS (real or self-signed)   |
-| 4 | Shadowsocks  | Xray-core  | TCP/UDP   | built-in (selectable cipher)|
-| 5 | SOCKS        | Xray-core  | TCP/UDP   | none                        |
+| 1 | VLESS        | Xray-core  | tcp/ws/grpc/http/httpupgrade | none/TLS/REALITY |
+| 2 | VMESS        | Xray-core  | tcp/ws/grpc/http/httpupgrade | none/TLS/REALITY |
+| 3 | Trojan       | Xray-core  | tcp/ws/grpc/http/httpupgrade | none/TLS/REALITY |
+| 4 | Shadowsocks  | Xray-core  | TCP/UDP*  | cipher + optional TLS/REALITY |
+| 5 | SOCKS        | Xray-core  | TCP/UDP*  | optional TLS/REALITY |
 | 6 | Hysteria2    | Hysteria   | UDP       | TLS + Salamander obfuscation|
 
 > Pinned core versions: **Xray `v26.3.27`**, **Hysteria `v2.9.3`**.
@@ -159,7 +151,7 @@ security layer (again, use the **same** choices on both servers):
 - **Security:** `none`, `tls`, or `reality`.
   - **REALITY** — the installer runs `xray x25519` on the remote to generate a
     key pair and a random `shortId`, and asks for a camouflage `dest` / `serverName`
-    (default `www.microsoft.com`). It prints the **public key**, **shortId** and
+    (default `dl.google.com`). It prints the **public key**, **shortId** and
     **SNI** to enter on the local server. The raw generator output is also shown so
     you can copy values manually if needed.
   - **TLS** — real Let's Encrypt certificate or an auto self-signed one.
@@ -167,9 +159,15 @@ security layer (again, use the **same** choices on both servers):
   `xray vlessenc`; the `decryption` string goes on the remote and the printed
   `encryption` string on the local server.
 
-Guardrails: `xtls-rprx-vision` flow is only applied to VLESS over `tcp` with
-`tls`/`reality`, and is never combined with VLESS Encryption; `grpc` / `http`
-transports warn if you pick `none` security.
+Guardrails: `xtls-rprx-vision` flow is only applied to VLESS over `tcp` with `tls`/`reality`, and is never combined with VLESS Encryption. REALITY with `ws` or `httpupgrade` is rejected because Xray does not support those combinations; `grpc` / `http` warn when security is `none`.
+
+\* Shadowsocks/SOCKS UDP is available only with `security: none`; it is disabled under TLS/REALITY to avoid leaking native UDP outside the selected transport.
+
+### Upload performance tuning
+
+On a local Xray forwarder, tun2socks uses a 4 MB receive window with TCP receive auto-tuning, while the TUN transmit queue is enlarged to absorb upload bursts. If the kernel exposes BBR, Xray selects it only for the outbound tunnel socket; the host-wide congestion-control default is not changed. This improves high-latency/lossy upload at the cost of additional RAM per active connection.
+
+The local Hysteria client uses its BBR `aggressive` profile for upload and leaves explicit bandwidth limits unset. You can switch it to `standard` or `conservative` from `wild` → Edit configuration → option 11 if aggressive mode performs worse on a lossy route.
 
 `SOCKS` is unencrypted, and `Hysteria2` (separate core) relies on TLS + Salamander
 obfuscation.
@@ -193,13 +191,14 @@ It opens a management menu:
 4) Start
 5) Live logs
 6) Show config
-7) Schedule auto-restart (cron)
-8) Remove scheduled restart
-9) Uninstall
+7) Edit configuration
+8) Schedule auto-restart (cron)
+9) Remove scheduled restart
+10) Uninstall
+11) Back to main menu
 ```
 
-Option **7** installs a `crontab` entry that restarts the tunnel on a schedule
-(every 6h / 12h / daily, or a custom cron expression); option **8** removes it.
+Option **7** edits the saved installation and regenerates a validated configuration. Option **8** installs a tagged `crontab` restart schedule; option **9** removes only that tagged entry.
 
 Or use systemd directly:
 
@@ -213,6 +212,9 @@ Configuration lives in `/etc/wild-tunnel/`:
 
 - Xray protocols → `config.json`
 - Hysteria2 → `config.yaml`
+- Editable installation state → `wild.conf`
+
+These files are written atomically with mode `0600`. JSON is parsed by `jq` and semantically tested by Xray before service restart; Hysteria YAML is parsed with PyYAML.
 
 When a real certificate is used, a Let's Encrypt **deploy hook** at
 `/etc/letsencrypt/renewal-hooks/deploy/wild-tunnel.sh` restarts the service after
@@ -222,9 +224,7 @@ each automatic renewal, so the tunnel never serves an expired certificate.
 
 ## Uninstall
 
-Run the installer and choose option **3**, which stops and removes the service, the
-core binaries (`/usr/local/bin/wild-xray`), the configuration (`/etc/wild-tunnel`),
-and the renewal hook. Let's Encrypt certificates under `/etc/letsencrypt` are left
+Run the installer and choose Uninstall (option **3** before installation, or the management-menu option afterward). It stops both services, restores forwarding sysctls, removes scoped firewall rules, the core/helper binaries, manager command, configuration, cron entry, and renewal hook. Let's Encrypt certificates under `/etc/letsencrypt` are left
 untouched.
 
 ---
@@ -241,9 +241,8 @@ untouched.
 - `Shadowsocks` and `SOCKS` forward **TCP only** when tls/reality is enabled: their
   UDP would bypass the transport unmasked (Xray does not apply streamSettings to
   their native UDP path without XUDP).
-- Self-signed certificates use `CN=bing.com`. Xray v26 removed `allowInsecure`, so
-  the remote prints a **TLS cert SHA256 pin** that you enter on the local side
-  (`pinnedPeerCertSha256`). Use a real domain + Let's Encrypt to skip the pin.
+- Self-signed certificates use `CN=bing.com`. Xray v26 removed `allowInsecure`, so the remote prints a **TLS cert SHA256 pin** for `pinnedPeerCertSha256`. Hysteria2 uses the same trust model through `pinSHA256`; `insecure` is enabled only together with that pin.
+- Release assets for Xray, Hysteria, and tun2socks are version-pinned and SHA-256 verified before atomic installation. Configuration/state files and generated private keys inherit a restrictive `umask 077`.
 
 ---
 
@@ -267,7 +266,7 @@ Released under the [MIT License](LICENSE).
 - **Xray-core** — پروتکل‌های `VLESS`، `VMESS`، `Trojan`، `Shadowsocks`، `SOCKS`
 - **Hysteria2** (`apernet/hysteria`) — انتقال بومی روی UDP با اوبفوسکیشن Salamander
 
-ترافیک TCP و UDP روی پورت‌های انتخاب‌شده، هر دو از داخل تونل عبور داده می‌شوند.
+ترافیک TCP و UDP روی پورت‌های انتخاب‌شده عبور داده می‌شود؛ فقط در Shadowsocks/SOCKS همراه TLS یا REALITY، مسیر UDP عمداً غیرفعال است، چون UDP بومی Xray از لایهٔ استتار عبور نمی‌کند.
 
 ---
 
@@ -282,39 +281,32 @@ Released under the [MIT License](LICENSE).
  └──────────────┘                            └──────────────┘
    روی پورت‌های                                 تونل را می‌بندد و به
    انتخابی شما گوش می‌دهد                        127.0.0.1:<port> سمت
-   (dokodemo-door / port-forwarding)           خودش وصل می‌شود
+   (TUN/tun2socks or native forwarding)           خودش وصل می‌شود
 ```
 
 - **سرور خارج (گیرنده):** تونل را دریافت می‌کند و ترافیک را به `127.0.0.1:<port>` روی
   خودش می‌فرستد (از طریق outbound نوع `freedom` در Xray یا پروکسی داخلی Hysteria2).
   پنل/سرویس واقعی شما این‌جا گوش می‌دهد.
-- **سرور محلی (فورواردر):** پورت‌های انتخابی را باز می‌کند و هر چیزی که برسد را به داخل
-  تونل هدایت می‌کند. برای Xray از inbound نوع `dokodemo-door` و برای Hysteria2 از
-  `tcpForwarding` / `udpForwarding` بومی استفاده می‌شود.
+- **سرور محلی (فورواردر):** پورت‌های انتخابی را باز می‌کند. Hysteria2 از `tcpForwarding` / `udpForwarding` بومی استفاده می‌کند؛ Xray با قوانین محدود iptables، یک رابط TUN اختصاصی و باینری pinشدهٔ `tun2socks`، ترافیک را به inbound محلی SOCKS می‌رساند.
 
-سرویس به‌صورت یک یونیت واحد systemd با نام `wild-tunnel` اجرا می‌شود. فایل یونیت هنگام
-نصب و بر اساس هسته و نقش انتخابی ساخته می‌شود، بنابراین اجرای نصب‌کننده به هیچ مسیر
-خاصی وابسته نیست.
+هستهٔ تونل با یونیت `wild-tunnel` اجرا می‌شود. در سرور محلی Xray، یونیت دوم `wild-forward` نیز TUN و قوانین محدود فایروال را مدیریت می‌کند. هر دو یونیت هنگام نصب تولید و با filesystem سیستمی read-only، فضای موقت خصوصی و umask محدود سخت‌سازی می‌شوند.
 
 ---
 
 ## پیش‌نیازها
 
-- اوبونتو / دبیان با `systemd`
+- اوبونتو / دبیان **x86_64/amd64** با `systemd`
 - دسترسی `root` (با `sudo` یا کاربر root اجرا کنید)
 - دو سرور (یکی خارج، یکی محلی)
 - برای گواهی TLS **واقعی**: یک دامنه که به IP سرور خارج اشاره کند و پورت TCP شمارهٔ
   **۸۰** آزاد باشد (چالش standalone در Let's Encrypt)
 
 نصب‌کننده پیش از هر کاری، لیست پکیج‌ها را آپدیت و همهٔ پیش‌نیازهای موردنیازش را نصب
-می‌کند (`unzip`، `jq`، `openssl`، `uuid-runtime`، `wget`، `curl`، `iproute2`، `cron` و
-در صورت نیاز `certbot`).
+می‌کند (`unzip`، `jq`، `openssl`، `uuid-runtime`، `wget`، `iproute2`، `iptables`، `cron`، `python3`، `python3-yaml` و در صورت نیاز `certbot`).
 
 **بدون تداخل با پنل سنایی / 3x-ui.** همه‌چیز در namespace جدا است (سرویس
 `wild-tunnel`، مسیر `/usr/local/bin/wild-xray`، کانفیگ `/etc/wild-tunnel`، دستور
-`wild`)، پس هرگز به سرویس `x-ui` پنل و مسیرهای `/usr/local/x-ui`، `/etc/x-ui` و
-`/usr/bin/x-ui` دست نمی‌زند. تنها تداخل ممکن، پورتی است که پنل (پیش‌فرض `2053`) یا سرویس
-دیگری از آن استفاده کند — نصب‌کننده با `ss` بررسی و پیش از bind هشدار می‌دهد.
+`wild`)، پس به سرویس `x-ui` پنل و مسیرهای `/usr/local/x-ui`، `/etc/x-ui` و `/usr/bin/x-ui` دست نمی‌زند. بااین‌حال پورت انتخابی ممکن است با برنامه‌ای دیگر تداخل داشته باشد. همچنین سرور محلی Xray هنگام اجرا قوانین کاملاً محدود iptables می‌افزاید؛ مقادیر قبلی sysctl ذخیره و هنگام توقف/حذف فورواردر بازیابی می‌شوند.
 
 ---
 
@@ -359,8 +351,7 @@ sudo ./install.sh
 2. یک **پروتکل** انتخاب کنید (۱ تا ۶).
 3. اطلاعات ورود را وارد یا به‌صورت خودکار بسازید (UUID یا پسورد، و برای Hysteria2
    پسورد اوبفوسکیشن).
-4. برای `Trojan` / `Hysteria2` بین **گواهی واقعی Let's Encrypt** (نیازمند دامنه) یا
-   گواهی **self-signed** خودساخته انتخاب کنید.
+4. هنگام انتخاب TLS (یا Hysteria2)، بین **گواهی واقعی Let's Encrypt** و گواهی **self-signed** انتخاب کنید.
 
 در پایان، نصب‌کننده تمام جزئیات (پورت، پروتکل، UUID/پسورد، پسورد اوبفوسکیشن، SNI) را چاپ
 می‌کند. **آن‌ها را ذخیره کنید** — برای سرور محلی لازم‌شان دارید.
@@ -372,8 +363,7 @@ sudo ./install.sh
 1. **IP سرور خارج** را وارد کنید.
 2. **همان پورت تونل** و **همان پروتکل/اطلاعات ورود** سرور خارج را وارد کنید.
 3. **پورت‌هایی که می‌خواهید تونل شوند** را وارد کنید (با کاما جدا شوند، مثلاً `2053,8443`).
-4. برای `Trojan` / `Hysteria2` مشخص کنید که آیا سرور خارج از دامنهٔ واقعی استفاده می‌کند
-   (برای SNI / اعتبارسنجی گواهی درست).
+4. برای TLS/Hysteria2، دامنهٔ واقعی یا pin گواهی SHA-256 چاپ‌شده روی سرور خارج را وارد کنید. اتصال self-signed بدون pin پذیرفته نمی‌شود.
 
 پس از پایان، اتصال به `LOCAL_IP:<port>` از طریق تونل به `127.0.0.1:<port>` روی سرور خارج
 می‌رسد.
@@ -384,11 +374,11 @@ sudo ./install.sh
 
 | # | پروتکل       | هسته       | انتقال    | TLS                          |
 |---|--------------|------------|-----------|------------------------------|
-| ۱ | VLESS        | Xray-core  | TCP       | ندارد                        |
-| ۲ | VMESS        | Xray-core  | TCP       | ندارد                        |
-| ۳ | Trojan       | Xray-core  | TCP       | TLS (واقعی یا self-signed)    |
-| ۴ | Shadowsocks  | Xray-core  | TCP/UDP   | داخلی (cipher قابل انتخاب)     |
-| ۵ | SOCKS        | Xray-core  | TCP/UDP   | ندارد                        |
+| ۱ | VLESS        | Xray-core  | tcp/ws/grpc/http/httpupgrade | none/TLS/REALITY |
+| ۲ | VMESS        | Xray-core  | tcp/ws/grpc/http/httpupgrade | none/TLS/REALITY |
+| ۳ | Trojan       | Xray-core  | tcp/ws/grpc/http/httpupgrade | none/TLS/REALITY |
+| ۴ | Shadowsocks  | Xray-core  | TCP/UDP*  | cipher + TLS/REALITY اختیاری |
+| ۵ | SOCKS        | Xray-core  | TCP/UDP*  | TLS/REALITY اختیاری |
 | ۶ | Hysteria2    | Hysteria   | UDP       | TLS + اوبفوسکیشن Salamander   |
 
 > نسخه‌های ثابت هسته: **Xray نسخهٔ `v26.3.27`**، **Hysteria نسخهٔ `v2.9.3`**.
@@ -416,15 +406,21 @@ sudo ./install.sh
 - **Security:** `none`، `tls` یا `reality`.
   - **REALITY** — نصب‌کننده روی سرور خارج `xray x25519` را اجرا می‌کند تا جفت‌کلید و یک
     `shortId` تصادفی بسازد، و `dest` / `serverName` استتار را می‌پرسد (پیش‌فرض
-    `www.microsoft.com`). سپس **کلید عمومی**، **shortId** و **SNI** را چاپ می‌کند تا در
+    `dl.google.com`). سپس **کلید عمومی**، **shortId** و **SNI** را چاپ می‌کند تا در
     سرور ایران وارد کنید. خروجی خام دستور هم نمایش داده می‌شود تا در صورت نیاز دستی کپی کنید.
   - **TLS** — گواهی واقعی Let's Encrypt یا self-signed خودکار.
 - **VLESS Encryption** (فقط VLESS) — رمزنگاری پساکوانتومی ML-KEM با `xray vlessenc`؛ رشتهٔ
   `decryption` روی سرور خارج و رشتهٔ `encryption` چاپ‌شده روی سرور ایران قرار می‌گیرد.
 
-گاردریل‌ها: flow با نام `xtls-rprx-vision` فقط برای VLESS روی `tcp` با `tls`/`reality` ست
-می‌شود و هرگز با VLESS Encryption ترکیب نمی‌شود؛ انتقال‌های `grpc` / `http` اگر Security را
-`none` بگذارید هشدار می‌دهند.
+گاردریل‌ها: `xtls-rprx-vision` فقط برای VLESS روی `tcp` با `tls`/`reality` تنظیم می‌شود و با VLESS Encryption ترکیب نمی‌شود. REALITY روی `ws` یا `httpupgrade` به‌دلیل ناسازگاری Xray رد می‌شود؛ `grpc` / `http` با Security برابر `none` هشدار می‌گیرند.
+
+\* UDP در Shadowsocks/SOCKS فقط با `security: none` فعال است و زیر TLS/REALITY برای جلوگیری از نشت UDP بدون استتار غیرفعال می‌شود.
+
+### بهینه‌سازی سرعت آپلود
+
+در فورواردر محلی Xray، بافر دریافت tun2socks روی ۴ مگابایت همراه TCP auto-tuning تنظیم شده و صف ارسال TUN برای جذب burstهای آپلود بزرگ‌تر است. اگر کرنل BBR داشته باشد، Xray آن را فقط برای socket خروجی تونل انتخاب می‌کند و congestion control سراسری سیستم تغییر نمی‌کند. این تنظیم در مسیرهای پرتاخیر یا packet-loss معمولاً آپلود را بهتر می‌کند، اما برای هر اتصال فعال RAM بیشتری مصرف می‌شود.
+
+کلاینت محلی Hysteria از پروفایل BBR حالت `aggressive` استفاده می‌کند و bandwidth limit صریح ندارد. اگر روی مسیر بسیار ناپایدار نتیجه بدتر شد، از `wild` → Edit configuration → گزینهٔ ۱۱ آن را روی `standard` یا `conservative` بگذارید.
 
 پروتکل `SOCKS` بدون رمزنگاری است و `Hysteria2` (هستهٔ جدا) به TLS + اوبفوسکیشن Salamander
 متکی است.
@@ -448,13 +444,14 @@ wild
 4) Start
 5) Live logs
 6) Show config
-7) Schedule auto-restart (cron)
-8) Remove scheduled restart
-9) Uninstall
+7) Edit configuration
+8) Schedule auto-restart (cron)
+9) Remove scheduled restart
+10) Uninstall
+11) Back to main menu
 ```
 
-گزینهٔ **۷** یک ورودی `crontab` می‌سازد که تونل را طبق زمان‌بندی ری‌استارت می‌کند (هر ۶ یا
-۱۲ ساعت / روزانه، یا عبارت cron دلخواه)؛ گزینهٔ **۸** آن را حذف می‌کند.
+گزینهٔ **۷** تنظیمات ذخیره‌شده را ویرایش و کانفیگ معتبر را دوباره تولید می‌کند. گزینهٔ **۸** زمان‌بندی برچسب‌دار cron را می‌سازد و گزینهٔ **۹** فقط همان ورودی را حذف می‌کند.
 
 یا مستقیم از systemd استفاده کنید:
 
@@ -468,6 +465,9 @@ journalctl -u wild-tunnel -f      # مشاهدهٔ زندهٔ لاگ‌ها
 
 - پروتکل‌های Xray → فایل `config.json`
 - Hysteria2 → فایل `config.yaml`
+- وضعیت قابل‌ویرایش نصب → فایل `wild.conf`
+
+این فایل‌ها به‌صورت atomic و با mode برابر `0600` نوشته می‌شوند. JSON با `jq` parse و پیش از restart به‌صورت معنایی توسط Xray تست می‌شود؛ YAML نیز با PyYAML parse می‌شود.
 
 هنگام استفاده از گواهی واقعی، یک **deploy hook** در مسیر
 `/etc/letsencrypt/renewal-hooks/deploy/wild-tunnel.sh` بعد از هر تمدید خودکار، سرویس را
@@ -477,8 +477,7 @@ journalctl -u wild-tunnel -f      # مشاهدهٔ زندهٔ لاگ‌ها
 
 ## حذف نصب
 
-نصب‌کننده را اجرا کنید و گزینهٔ **۳** را انتخاب کنید؛ سرویس، باینری‌های هسته
-(`/usr/local/bin/wild-xray`)، پیکربندی (`/etc/wild-tunnel`) و hook تمدید حذف می‌شوند.
+گزینهٔ Uninstall را انتخاب کنید (پیش از نصب گزینهٔ **۳** و پس از نصب از منوی مدیریت). هر دو سرویس متوقف، sysctlها بازیابی و قوانین محدود فایروال، باینری‌ها، فرمان مدیریت، کانفیگ، cron و hook تمدید حذف می‌شوند.
 گواهی‌های Let's Encrypt در مسیر `/etc/letsencrypt` دست‌نخورده باقی می‌مانند.
 
 ---
@@ -495,10 +494,8 @@ journalctl -u wild-tunnel -f      # مشاهدهٔ زندهٔ لاگ‌ها
 - `Shadowsocks` و `SOCKS` وقتی tls/reality فعال باشد فقط **TCP** را فوروارد می‌کنند؛
   چون UDP آن‌ها بدون استتار از کنار لایهٔ ترنسپورت رد می‌شود (Xray بدون XUDP روی
   مسیر UDP بومی این پروتکل‌ها streamSettings اعمال نمی‌کند).
-- گواهی‌های self-signed از `CN=bing.com` استفاده می‌کنند. Xray نسخهٔ ۲۶ فیلد
-  `allowInsecure` را حذف کرده، پس سرور خارج یک **هش SHA256 گواهی** چاپ می‌کند که
-  باید در سرور ایران وارد شود (`pinnedPeerCertSha256`). با دامنهٔ واقعی +
-  Let's Encrypt نیازی به این هش نیست.
+- گواهی self-signed از `CN=bing.com` استفاده می‌کند. Xray v26 فیلد `allowInsecure` را حذف کرده و pin در `pinnedPeerCertSha256` قرار می‌گیرد. Hysteria2 نیز با `pinSHA256` همین مدل اعتماد را دارد و `insecure` فقط همراه pin فعال می‌شود.
+- فایل‌های release مربوط به Xray، Hysteria و tun2socks به نسخه و SHA-256 ثابت pin شده‌اند و پیش از نصب atomic اعتبارسنجی می‌شوند. کانفیگ، state و کلیدهای خصوصی با `umask 077` ساخته می‌شوند.
 
 ---
 
