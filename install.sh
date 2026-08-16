@@ -766,6 +766,7 @@ prompt_vless_encryption() {
 # Interactive part (asks for dest + SNI). Back-aware.
 prompt_reality_dest() {
     echo -e "${YELLOW}Tip: REALITY dest must use TLS1.3 with a SMALL cert (ECDSA). Good: dl.google.com, www.cloudflare.com. Avoid big RSA chains like www.microsoft.com.${NC}"
+    echo -e "${YELLOW}For stronger camouflage, choose a target hosted in the same ASN as this server. The installer can validate TLS, but cannot prove the ASN match.${NC}"
     read -p "REALITY dest (camouflage site) [Default: dl.google.com:443] (0=Back): " REALITY_DEST
     [ "$REALITY_DEST" = "0" ] && return $BACK_RC
     REALITY_DEST=${REALITY_DEST:-dl.google.com:443}
@@ -773,6 +774,53 @@ prompt_reality_dest() {
     [ "$REALITY_SNI" = "0" ] && return $BACK_RC
     REALITY_SNI=${REALITY_SNI:-dl.google.com}
     return 0
+}
+
+# Validate the selected REALITY target with the Xray version that will run the
+# tunnel. xray tls ping always probes port 443; -ip pins the probe to the
+# resolved target address while REALITY_SNI supplies the TLS server name.
+validate_reality_target() {
+    local target_host target_port target_ip output sni_result
+    if [[ "$REALITY_DEST" =~ ^\[([0-9A-Fa-f:]+)\]:([0-9]+)$ ]]; then
+        target_host="${BASH_REMATCH[1]}"
+        target_port="${BASH_REMATCH[2]}"
+    elif [[ "$REALITY_DEST" =~ ^([^:]+):([0-9]+)$ ]]; then
+        target_host="${BASH_REMATCH[1]}"
+        target_port="${BASH_REMATCH[2]}"
+    else
+        echo -e "${RED}Invalid REALITY target '$REALITY_DEST'; expected host:port.${NC}" >&2
+        return 1
+    fi
+    (( target_port >= 1 && target_port <= 65535 )) || {
+        echo -e "${RED}Invalid REALITY target port: $target_port${NC}" >&2
+        return 1
+    }
+
+    if [[ "$target_host" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$target_host" == *:* ]]; then
+        target_ip="$target_host"
+    else
+        target_ip=$(getent ahostsv4 "$target_host" 2>/dev/null | awk 'NR == 1 { print $1 }') || true
+        [ -n "$target_ip" ] || target_ip=$(getent ahostsv6 "$target_host" 2>/dev/null | awk 'NR == 1 { print $1 }') || true
+    fi
+    [ -n "$target_ip" ] || {
+        echo -e "${RED}Could not resolve REALITY target: $target_host${NC}" >&2
+        return 1
+    }
+
+    echo -e "${GREEN}Validating REALITY target $target_host ($target_ip) with xray tls ping...${NC}"
+    output=$(timeout 20 "$CORE_DIR/xray" tls ping -ip "$target_ip" "$REALITY_SNI" 2>&1) || true
+    sni_result=$(printf '%s\n' "$output" | sed -n '/Pinging with SNI/,$p')
+    if [[ "$sni_result" != *"Handshake succeeded"* ]] || \
+       ! grep -Eq 'TLS Version:[[:space:]]+TLS 1\.3' <<< "$sni_result"; then
+        echo "$output" >&2
+        echo -e "${RED}REALITY target did not complete a TLS 1.3 handshake with SNI '$REALITY_SNI'.${NC}" >&2
+        return 1
+    fi
+    echo -e "${GREEN}REALITY target passed the TLS 1.3 handshake check.${NC}"
+    if [[ "$target_port" != "443" ]]; then
+        echo -e "${YELLOW}Warning: xray tls ping probes port 443 only; the selected port $target_port was not validated by this command.${NC}"
+    fi
+    echo -e "${YELLOW}Same-ASN warning: xray tls ping cannot verify ASN ownership. For best REALITY camouflage, confirm that the target IP and this server are hosted in the same ASN.${NC}"
 }
 
 # Generation part (runs after install, needs the installed xray binary).
@@ -872,7 +920,11 @@ stream_json() {
         tls)
             parts+=("\"security\": \"tls\"")
             if [[ "$role" == "remote" ]]; then
-                parts+=("\"tlsSettings\": { \"certificates\": [ { \"certificateFile\": $(json_quote "$CERT_FILE"), \"keyFile\": $(json_quote "$KEY_FILE") } ] }")
+                local tls_remote="\"certificates\": [ { \"certificateFile\": $(json_quote "$CERT_FILE"), \"keyFile\": $(json_quote "$KEY_FILE") } ]"
+                if [[ "${USE_REAL_SSL:-}" == "y" || "${USE_REAL_SSL:-}" == "Y" ]]; then
+                    tls_remote="\"rejectUnknownSni\": true, $tls_remote"
+                fi
+                parts+=("\"tlsSettings\": { $tls_remote }")
             else
                 local tls_local="\"serverName\": $(json_quote "$LOCAL_SERVER_NAME")"
                 [ -n "$LOCAL_PINNED_SHA" ] && tls_local="$tls_local, \"pinnedPeerCertSha256\": $(json_quote "$LOCAL_PINNED_SHA")"
@@ -967,6 +1019,8 @@ prompt_tls_domain() {
     if [[ "$USE_REAL_SSL" == "y" || "$USE_REAL_SSL" == "Y" ]]; then
         read -p "Enter your Domain Name (e.g., sub.domain.com) (0=Back): " DOMAIN
         [ "$DOMAIN" = "0" ] && return $BACK_RC
+    else
+        echo -e "${YELLOW}Security warning: self-signed TLS with certificate pinning protects authenticity, but is fingerprintable and is not recommended for anti-DPI. Prefer REALITY or TLS with a real domain.${NC}"
     fi
     return 0
 }
@@ -994,6 +1048,7 @@ systemctl restart wild-tunnel
 HOOK
         chmod +x /etc/letsencrypt/renewal-hooks/deploy/wild-tunnel.sh
     else
+        echo -e "${YELLOW}Security warning: self-signed TLS is not recommended for anti-DPI; use REALITY or a real-domain certificate when possible.${NC}"
         CERT_FILE="$CONF_DIR/cert.crt"
         KEY_FILE="$CONF_DIR/private.key"
         SERVER_NAME="bing.com"
@@ -1093,7 +1148,8 @@ create_remote_config() {
     if [[ "$ENGINE" == "hysteria" ]]; then
         make_certs
         acl_tmp=$(mktemp "$CONF_DIR/.hysteria-acl.XXXXXX") || die "Could not create Hysteria ACL"
-        printf 'direct(%s, *, 127.0.0.1)\ndirect(all)\n' "$SENTINEL_IP" > "$acl_tmp"
+        printf 'direct(%s, *, 127.0.0.1)\ndirect(connectivitycheck.gstatic.com, tcp/443)\nreject(all)\n' \
+            "$SENTINEL_IP" > "$acl_tmp"
         install -m 0600 "$acl_tmp" "$CONF_DIR/hysteria.acl" || {
             rm -f -- "$acl_tmp"
             die "Could not install Hysteria ACL"
@@ -1110,6 +1166,7 @@ create_remote_config() {
         if [[ "$SECURITY" == "tls" ]]; then
             make_certs
         elif [[ "$SECURITY" == "reality" ]]; then
+            validate_reality_target || die "REALITY target validation failed; choose a reachable TLS 1.3 target with a matching SNI"
             [ -z "$REALITY_PRIVATE" ] && make_reality_keys
             [ -z "$REALITY_SHORTID" ] && REALITY_SHORTID=$(openssl rand -hex 8)
         fi
@@ -1299,7 +1356,7 @@ build_multi_inbounds() {
 
 create_multi_local_config() {
     local tmp build locations_build old_locations="" previous_list out_file in_file tcp_file udp_file hy_list_file count i p tag settings stream
-    local socks_port inbounds outbounds tcp_selectors udp_selectors tcp_fallback udp_fallback udp_count strategy
+    local socks_port inbounds outbounds tcp_selectors udp_selectors tcp_fallback udp_fallback tcp_count udp_count strategy
     ensure_locations_from_legacy
     strategy=$(jq -r '.strategy // "leastLoad"' "$LOCATIONS_FILE")
     [[ "$strategy" == "random" || "$strategy" == "roundRobin" || "$strategy" == "leastPing" || "$strategy" == "leastLoad" ]] \
@@ -1355,6 +1412,7 @@ create_multi_local_config() {
     udp_selectors=$(jq -R -s 'split("\n") | map(select(length > 0))' "$udp_file")
     tcp_fallback=$(sed -n '1p' "$tcp_file")
     udp_fallback=$(sed -n '1p' "$udp_file")
+    tcp_count=$(jq 'length' <<< "$tcp_selectors")
     udp_count=$(jq 'length' <<< "$udp_selectors")
     [ -n "$tcp_fallback" ] || { rm -rf -- "$build"; die "No TCP-capable location configured"; }
 
@@ -1363,23 +1421,34 @@ create_multi_local_config() {
       --argjson inbounds "$inbounds" --argjson outbounds "$outbounds" --argjson tcpSelectors "$tcp_selectors" \
       --argjson udpSelectors "$udp_selectors" --arg tcpFallback "$tcp_fallback" \
       --arg udpFallback "$udp_fallback" --arg strategy "$strategy" \
-      --argjson udpCount "$udp_count" '
-      {
+      --argjson tcpCount "$tcp_count" --argjson udpCount "$udp_count" '
+      ({
         log: {loglevel:"warning"},
         inbounds:$inbounds,
         outbounds:$outbounds,
         routing:{
           domainStrategy:"AsIs",
-          rules: ([{type:"field", network:"tcp", balancerTag:"wild-tcp"}] +
-                  (if $udpCount > 0 then [{type:"field", network:"udp", balancerTag:"wild-udp"}] else [] end)),
-          balancers: ([{
+          rules: ([(if $tcpCount > 1 then
+                      {type:"field", network:"tcp", balancerTag:"wild-tcp"}
+                    else
+                      {type:"field", network:"tcp", outboundTag:$tcpFallback}
+                    end)] +
+                  (if $udpCount > 0 then
+                    [(if $udpCount > 1 then
+                        {type:"field", network:"udp", balancerTag:"wild-udp"}
+                      else
+                        {type:"field", network:"udp", outboundTag:$udpFallback}
+                      end)]
+                   else [] end)),
+          balancers: ((if $tcpCount > 1 then [{
             tag:"wild-tcp", selector:$tcpSelectors, fallbackTag:$tcpFallback,
             strategy:{type:$strategy}
-          }] + (if $udpCount > 0 then [{
+          }] else [] end) + (if $udpCount > 1 then [{
             tag:"wild-udp", selector:$udpSelectors, fallbackTag:$udpFallback,
             strategy:{type:$strategy}
           }] else [] end))
-        },
+        }
+      } + (if $tcpCount > 1 or $udpCount > 1 then {
         burstObservatory:{
           subjectSelector:["wild-node-"],
           pingConfig:{
@@ -1387,7 +1456,7 @@ create_multi_local_config() {
             connectivity:"", interval:"1m", sampling:5, timeout:"5s", httpMethod:"HEAD"
           }
         }
-      }' > "$tmp" || { rm -rf -- "$build"; rm -f -- "$tmp"; die "Could not generate multi-location config"; }
+      } else {} end))' > "$tmp" || { rm -rf -- "$build"; rm -f -- "$tmp"; die "Could not generate multi-location config"; }
 
     jq -e . "$tmp" >/dev/null || { rm -rf -- "$build"; rm -f -- "$tmp"; die "Generated Xray JSON is invalid"; }
     "$CORE_DIR/xray" run -test -config "$tmp" >/dev/null 2>&1 || {

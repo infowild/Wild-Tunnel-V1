@@ -96,7 +96,7 @@ Choose option **1**, then:
 2. Pick a **protocol** (1–6).
 3. Provide/auto-generate the credentials (UUID or password, plus obfuscation
    password for Hysteria2).
-4. When TLS is selected (or when using Hysteria2), choose between a **real Let's Encrypt certificate** (needs a domain) or an auto-generated **self-signed** certificate.
+4. When TLS is selected (or when using Hysteria2), choose between a **real Let's Encrypt certificate** (needs a domain) or an auto-generated **self-signed** certificate. Self-signed TLS is pinned for authentication, but is **not recommended for anti-DPI**; prefer REALITY or a real-domain certificate.
 
 At the end the installer prints all the details (port, protocol, UUID/password,
 obfuscation password, SNI). **Save them** — you need them for the local server.
@@ -118,7 +118,7 @@ remote server through the tunnel.
 
 - A location is one remote endpoint plus its protocol, credentials, security, and tunnel-port list. Locations may freely mix Xray protocols and Hysteria2.
 - Each Xray tunnel port becomes an independent outbound path. Hysteria2 accepts comma lists/ranges as native port hopping and each Hysteria location gets its own managed client instance.
-- The default `leastLoad` strategy uses Xray health observations and keeps a fallback path. `leastPing`, `roundRobin`, and `random` are also available under `wild` → **Edit configuration** → **Manage Locations / Load Balancing**.
+- The default `leastLoad` strategy uses Xray health observations and keeps a fallback path when more than one eligible path exists. A single-path installation routes directly and does not send periodic health probes. `leastPing`, `roundRobin`, and `random` are also available under `wild` → **Edit configuration** → **Manage Locations / Load Balancing**.
 - TCP and UDP use separate eligible-path pools, so a TCP-only location is never selected for UDP.
 - New installations use `direct` forwarding: Xray binds the service ports itself and bypasses the userspace TUN stack. `tun-legacy` can be selected from the edit menu if direct binding is incompatible with another local service.
 - Existing single-location local installations are migrated automatically to `/etc/wild-tunnel/locations.json` the first time the new edit/apply path is used.
@@ -163,8 +163,13 @@ security layer (again, use the **same** choices on both servers):
     key pair and a random `shortId`, and asks for a camouflage `dest` / `serverName`
     (default `dl.google.com`). It prints the **public key**, **shortId** and
     **SNI** to enter on the local server. The raw generator output is also shown so
-    you can copy values manually if needed.
-  - **TLS** — real Let's Encrypt certificate or an auto self-signed one.
+    you can copy values manually if needed. Before generating the config, the pinned
+    Xray binary runs `xray tls ping` against the resolved target IP and requires a
+    TLS 1.3 handshake. This cannot prove ASN ownership: for stronger camouflage,
+    manually choose a target hosted in the same ASN as the remote server.
+  - **TLS** — real Let's Encrypt certificate or an auto self-signed one. Real-domain
+    TLS enables `rejectUnknownSni`; self-signed TLS remains certificate-pinned but is
+    not recommended as an anti-DPI profile.
 - **VLESS Encryption** (VLESS only) — post-quantum ML-KEM encryption via
   `xray vlessenc`; the `decryption` string goes on the remote and the printed
   `encryption` string on the local server.
@@ -258,7 +263,8 @@ untouched.
 - `Shadowsocks` and `SOCKS` forward **TCP only** when tls/reality is enabled: their
   UDP would bypass the transport unmasked (Xray does not apply streamSettings to
   their native UDP path without XUDP).
-- Self-signed certificates use `CN=bing.com`. Xray v26 removed `allowInsecure`, so the remote prints a **TLS cert SHA256 pin** for `pinnedPeerCertSha256`. Hysteria2 uses the same trust model through `pinSHA256`; `insecure` is enabled only together with that pin.
+- Self-signed certificates use `CN=bing.com`. Xray v26 removed `allowInsecure`, so the remote prints a **TLS cert SHA256 pin** for `pinnedPeerCertSha256`. Hysteria2 uses the same trust model through `pinSHA256`; `insecure` is enabled only together with that pin. Pinning protects server authentication, but the self-signed handshake remains fingerprintable and is not recommended for anti-DPI.
+- Real-domain Xray TLS rejects unknown SNI. The Hysteria server ACL permits only the forwarding sentinel and the exact health-check destination, then ends with `reject(all)`; authenticated tunnel users cannot use it as a general-purpose proxy.
 - Release assets for Xray, Hysteria, and tun2socks are version-pinned and SHA-256 verified before atomic installation. Configuration/state files and generated private keys inherit a restrictive `umask 077`.
 
 ---
@@ -368,7 +374,7 @@ sudo ./install.sh
 2. یک **پروتکل** انتخاب کنید (۱ تا ۶).
 3. اطلاعات ورود را وارد یا به‌صورت خودکار بسازید (UUID یا پسورد، و برای Hysteria2
    پسورد اوبفوسکیشن).
-4. هنگام انتخاب TLS (یا Hysteria2)، بین **گواهی واقعی Let's Encrypt** و گواهی **self-signed** انتخاب کنید.
+4. هنگام انتخاب TLS (یا Hysteria2)، بین **گواهی واقعی Let's Encrypt** و گواهی **self-signed** انتخاب کنید. TLS خودامضا با pin احراز هویت می‌شود، اما برای **مقاومت در برابر DPI توصیه نمی‌شود**؛ REALITY یا گواهی دامنهٔ واقعی را ترجیح دهید.
 
 در پایان، نصب‌کننده تمام جزئیات (پورت، پروتکل، UUID/پسورد، پسورد اوبفوسکیشن، SNI) را چاپ
 می‌کند. **آن‌ها را ذخیره کنید** — برای سرور محلی لازم‌شان دارید.
@@ -390,7 +396,7 @@ sudo ./install.sh
 
 - هر location شامل endpoint خارج، پروتکل، اطلاعات ورود، امنیت و فهرست پورت‌های تونل خودش است؛ locationها می‌توانند ترکیبی از پروتکل‌های Xray و Hysteria2 باشند.
 - هر پورت Xray یک مسیر outbound مستقل می‌شود. Hysteria2 فهرست/بازهٔ پورت را به‌صورت port hopping بومی استفاده می‌کند و برای هر location آن یک کلاینت systemd جدا ساخته می‌شود.
-- استراتژی پیش‌فرض `leastLoad` با health observation خود Xray مسیر سالم‌تر را انتخاب و fallback نگه می‌دارد. گزینه‌های `leastPing`، `roundRobin` و `random` نیز از مسیر `wild` → **Edit configuration** → **Manage Locations / Load Balancing** در دسترس‌اند.
+- استراتژی پیش‌فرض `leastLoad` وقتی بیش از یک مسیر واجدشرایط وجود دارد با health observation خود Xray مسیر سالم‌تر را انتخاب و fallback نگه می‌دارد. نصب تک‌مسیر مستقیم route می‌شود و health probe دوره‌ای نمی‌فرستد. گزینه‌های `leastPing`، `roundRobin` و `random` نیز از مسیر `wild` → **Edit configuration** → **Manage Locations / Load Balancing** در دسترس‌اند.
 - pool مسیرهای TCP و UDP جداست؛ در نتیجه location فقط-TCP هیچ‌وقت برای UDP انتخاب نمی‌شود.
 - نصب جدید به‌صورت پیش‌فرض از forwarding حالت `direct` استفاده می‌کند: خود Xray پورت‌های سرویس را bind می‌کند و پشتهٔ TUN کاربرانpace حذف می‌شود. اگر bind مستقیم با سرویس محلی دیگری ناسازگار بود، `tun-legacy` از منوی Edit قابل انتخاب است.
 - نصب‌های تک‌لوکیشن قدیمی در اولین Edit/Apply به‌صورت خودکار به `/etc/wild-tunnel/locations.json` مهاجرت می‌کنند.
@@ -434,8 +440,8 @@ sudo ./install.sh
   - **REALITY** — نصب‌کننده روی سرور خارج `xray x25519` را اجرا می‌کند تا جفت‌کلید و یک
     `shortId` تصادفی بسازد، و `dest` / `serverName` استتار را می‌پرسد (پیش‌فرض
     `dl.google.com`). سپس **کلید عمومی**، **shortId** و **SNI** را چاپ می‌کند تا در
-    سرور ایران وارد کنید. خروجی خام دستور هم نمایش داده می‌شود تا در صورت نیاز دستی کپی کنید.
-  - **TLS** — گواهی واقعی Let's Encrypt یا self-signed خودکار.
+    سرور ایران وارد کنید. خروجی خام دستور هم نمایش داده می‌شود تا در صورت نیاز دستی کپی کنید. پیش از ساخت کانفیگ، همان باینری pin‌شدهٔ Xray با `xray tls ping`، IP resolveشدهٔ target و handshake نوع TLS 1.3 را بررسی می‌کند. این فرمان ASN را اثبات نمی‌کند؛ برای استتار قوی‌تر، target را دستی از همان ASN سرور خارج انتخاب کنید.
+  - **TLS** — گواهی واقعی Let's Encrypt یا self-signed خودکار. برای دامنهٔ واقعی `rejectUnknownSni` فعال می‌شود؛ TLS خودامضا با وجود pin برای ضد-DPI توصیه نمی‌شود.
 - **VLESS Encryption** (فقط VLESS) — رمزنگاری پساکوانتومی ML-KEM با `xray vlessenc`؛ رشتهٔ
   `decryption` روی سرور خارج و رشتهٔ `encryption` چاپ‌شده روی سرور ایران قرار می‌گیرد.
 
@@ -528,7 +534,8 @@ systemctl status 'wild-hysteria-client@*'  # کلاینت‌های locationها�
 - `Shadowsocks` و `SOCKS` وقتی tls/reality فعال باشد فقط **TCP** را فوروارد می‌کنند؛
   چون UDP آن‌ها بدون استتار از کنار لایهٔ ترنسپورت رد می‌شود (Xray بدون XUDP روی
   مسیر UDP بومی این پروتکل‌ها streamSettings اعمال نمی‌کند).
-- گواهی self-signed از `CN=bing.com` استفاده می‌کند. Xray v26 فیلد `allowInsecure` را حذف کرده و pin در `pinnedPeerCertSha256` قرار می‌گیرد. Hysteria2 نیز با `pinSHA256` همین مدل اعتماد را دارد و `insecure` فقط همراه pin فعال می‌شود.
+- گواهی self-signed از `CN=bing.com` استفاده می‌کند. Xray v26 فیلد `allowInsecure` را حذف کرده و pin در `pinnedPeerCertSha256` قرار می‌گیرد. Hysteria2 نیز با `pinSHA256` همین مدل اعتماد را دارد و `insecure` فقط همراه pin فعال می‌شود. Pin احراز هویت سرور را محافظت می‌کند، اما handshake خودامضا همچنان fingerprintپذیر است و برای ضد-DPI توصیه نمی‌شود.
+- TLS دامنهٔ واقعی در Xray، SNI ناشناخته را رد می‌کند. ACL سرور Hysteria فقط sentinel فوروارد و مقصد دقیق health-check را مجاز می‌گذارد و با `reject(all)` تمام درخواست‌های دیگر را می‌بندد؛ بنابراین کاربر احرازشده نمی‌تواند تونل را به‌عنوان پراکسی عمومی استفاده کند.
 - فایل‌های release مربوط به Xray، Hysteria و tun2socks به نسخه و SHA-256 ثابت pin شده‌اند و پیش از نصب atomic اعتبارسنجی می‌شوند. کانفیگ، state و کلیدهای خصوصی با `umask 077` ساخته می‌شوند.
 
 ---

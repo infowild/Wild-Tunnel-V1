@@ -123,6 +123,35 @@ for NETWORK in tcp ws grpc http httpupgrade; do
     done
 done
 
+NETWORK='tcp'
+SECURITY='tls'
+USE_REAL_SSL='y'
+[[ $(stream_json remote) == *'"rejectUnknownSni": true'* ]] ||
+    fail "real-domain TLS does not reject unknown SNI"
+USE_REAL_SSL='n'
+[[ $(stream_json remote) != *'"rejectUnknownSni"'* ]] ||
+    fail "self-signed TLS unexpectedly rejects unknown SNI"
+
+TLS_PING_CORE="$TEST_DIR/tls-ping-core"
+mkdir -p "$TLS_PING_CORE"
+cat > "$TLS_PING_CORE/xray" <<'MOCK'
+#!/bin/sh
+[ "$1" = tls ] && [ "$2" = ping ] && [ "$3" = -ip ] && [ "$4" = 203.0.113.20 ] && [ "$5" = reality.example ] || exit 2
+cat <<'OUTPUT'
+Pinging with SNI
+Handshake succeeded
+TLS Version:                       TLS 1.3
+TLS ping finished
+OUTPUT
+MOCK
+chmod +x "$TLS_PING_CORE/xray"
+CORE_DIR="$TLS_PING_CORE"
+REALITY_DEST='203.0.113.20:443'
+REALITY_SNI='reality.example'
+validate_reality_target >/dev/null || fail "valid REALITY TLS target was rejected"
+REALITY_DEST='dl.google.com:443'
+REALITY_SNI='dl.google.com'
+
 preferred_tcp_congestion() { printf '%s\n' bbr; }
 NETWORK='tcp'
 SECURITY='none'
@@ -183,6 +212,12 @@ grep -q 'listen: ":32000-32002"' "$CONF_DIR/config.yaml" ||
     fail "remote Hysteria port range was not generated"
 grep -q '^direct(198.18.0.2, \*, 127.0.0.1)$' "$CONF_DIR/hysteria.acl" ||
     fail "remote Hysteria sentinel ACL is missing"
+grep -q '^direct(connectivitycheck.gstatic.com, tcp/443)$' "$CONF_DIR/hysteria.acl" ||
+    fail "remote Hysteria health-check ACL is missing"
+grep -q '^reject(all)$' "$CONF_DIR/hysteria.acl" ||
+    fail "remote Hysteria default-reject ACL is missing"
+! grep -q '^direct(all)$' "$CONF_DIR/hysteria.acl" ||
+    fail "remote Hysteria ACL still permits unrestricted direct access"
 if [[ -n ${HYSTERIA_TEST_BINARY:-} ]]; then
     HYSTERIA_LOG="$TEST_DIR/hysteria-server.log"
     set +e
@@ -285,6 +320,37 @@ if [[ -n ${HYSTERIA_TEST_BINARY:-} ]]; then
         fail "Hysteria rejected the generated multi-location client config"
     fi
 fi
+
+# A single eligible tunnel path is routed directly. It must not create a
+# periodic observatory or a health-dependent balancer.
+CONF_DIR="$TEST_DIR/single-local"
+LOCATIONS_FILE="$CONF_DIR/locations.json"
+LOCATIONS_DIR="$CONF_DIR/locations"
+HYSTERIA_CLIENT_LIST="$CONF_DIR/hysteria-clients.list"
+HYSTERIA_CLIENT_PREVIOUS="$CONF_DIR/hysteria-clients.previous"
+mkdir -p "$CONF_DIR"
+ROLE='local'
+LOCATION_NAME='Single-Xray'
+ENGINE='xray'
+PROTOCOL='vmess'
+REMOTE_IP='203.0.113.30'
+TUNNEL_PORTS='443'
+TUNNEL_PORT='443'
+UUID='00000000-0000-4000-8000-000000000001'
+NETWORK='tcp'
+SECURITY='none'
+FLOW=''
+NODE_SINGLE=$(current_location_json 'single' "$LOCATION_NAME")
+jq -n --argjson node "$NODE_SINGLE" '{version:1, strategy:"leastLoad", nodes:[$node]}' > "$LOCATIONS_FILE"
+FORWARD_PORTS='23458'
+FORWARD_MODE='direct'
+create_multi_local_config
+jq -e '(.routing.balancers | length) == 0 and
+       (has("burstObservatory") | not) and
+       all(.routing.rules[]; has("outboundTag") and (has("balancerTag") | not))' \
+    "$CONF_DIR/config.json" >/dev/null ||
+    fail "single-path config still uses periodic health probing or a balancer"
+assert_xray_runs "$CONF_DIR/config.json" 'single-path'
 
 ENGINE='hysteria'
 HYSTERIA_BBR_PROFILE='aggressive'
