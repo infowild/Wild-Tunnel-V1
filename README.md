@@ -1,10 +1,11 @@
-# Wild Tunnel v1
+# Wild Tunnel v2
 
-**English** | [فارسی](#wild-tunnel-v1-فارسی)
+**English** | [فارسی](#wild-tunnel-v2-فارسی)
 
-A single-file installer for a **two-server tunnel** designed to forward ports from a
-local server (e.g. inside Iran) to a remote server abroad. It supports multiple
-transport protocols powered by two cores:
+A single-file installer for a tunnel with **one Local forwarder and one or more
+Remote receivers**, designed to forward ports from a local server (e.g. inside
+Iran) to servers abroad. It supports multiple transport protocols powered by two
+cores:
 
 - **Xray-core** — `VLESS`, `VMESS`, `Trojan`, `Shadowsocks`, `SOCKS`
 - **Hysteria2** (`apernet/hysteria`) — native UDP transport with Salamander obfuscation
@@ -40,7 +41,7 @@ The tunnel core and direct listeners run as `wild-tunnel`. Only `tun-legacy` mod
 
 - Ubuntu / Debian on **x86_64/amd64** with `systemd`
 - `root` access (run with `sudo` or as root)
-- Two servers (one abroad, one local)
+- One Local server and one or more Remote servers
 - For a **real** TLS certificate: a domain pointing at the remote server and TCP
   port **80** free (Let's Encrypt standalone challenge)
 
@@ -62,7 +63,7 @@ command), so it never touches the panel's `x-ui` service, `/usr/local/x-ui`,
 Run this on **each** server (as root) and follow the prompts:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/infowild/Wild-Tunnel-V1/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/infowild/Wild-Tunnel-V1/wild-tunnel-v2/install.sh)
 ```
 
 > Use `bash <(curl ...)`, **not** `curl ... | bash` — the installer is interactive
@@ -74,11 +75,30 @@ bash <(curl -fsSL https://raw.githubusercontent.com/infowild/Wild-Tunnel-V1/main
 Alternatively, clone the repository and run the installer:
 
 ```bash
-git clone https://github.com/infowild/Wild-Tunnel-V1.git wild-tunnel
+git clone --branch wild-tunnel-v2 --single-branch https://github.com/infowild/Wild-Tunnel-V1.git wild-tunnel
 cd wild-tunnel
 chmod +x install.sh
 sudo ./install.sh
 ```
+
+### Upgrade an existing installation without uninstalling
+
+Download/run the v2 installer above on the **Remote server first**, then on the
+**Local (Iran) server**. Do not choose either Install option. Use:
+
+```text
+3) Management menu
+7) Edit Configuration
+a) Apply changes
+```
+
+`Apply` regenerates the service/config from `/etc/wild-tunnel/wild.conf` while
+preserving the saved credentials, REALITY keys, and reusable certificate. On an
+older Local installation, open **Manage Locations / Load Balancing** once to
+migrate the current connection into the first location; select `direct` under
+**Forwarding Mode** if you also want the v2 forwarding path, then Apply. If
+`/etc/wild-tunnel/wild.conf` does not exist, stop: the existing installation has
+no state that v2 can migrate safely.
 
 You will be asked to choose a role:
 
@@ -116,6 +136,7 @@ remote server through the tunnel.
 
 ### Multi-location and multi-port
 
+- Multi-location is configured only on the **Local (Iran) server**, which aggregates several independent Remote receivers. Install option **1** separately on every Remote server; it intentionally has no “add location” prompt. Install option **2** on Iran asks `Add another remote location now?` after the first location's forwarding ports.
 - A location is one remote endpoint plus its protocol, credentials, security, and tunnel-port list. Locations may freely mix Xray protocols and Hysteria2.
 - Each Xray tunnel port becomes an independent outbound path. Hysteria2 accepts comma lists/ranges as native port hopping and each Hysteria location gets its own managed client instance.
 - The default `leastLoad` strategy uses Xray health observations and keeps a fallback path when more than one eligible path exists. A single-path installation routes directly and does not send periodic health probes. `leastPing`, `roundRobin`, and `random` are also available under `wild` → **Edit configuration** → **Manage Locations / Load Balancing**.
@@ -278,13 +299,13 @@ Released under the [MIT License](LICENSE).
 
 <div dir="rtl">
 
-# Wild Tunnel v1 (فارسی)
+# Wild Tunnel v2 (فارسی)
 
-[English](#wild-tunnel-v1) | **فارسی**
+[English](#wild-tunnel-v2) | **فارسی**
 
-یک نصب‌کنندهٔ تک‌فایلی برای ساخت یک **تونل دوسروری** که پورت‌ها را از یک سرور محلی
-(مثلاً داخل ایران) به یک سرور خارج منتقل می‌کند. از چند پروتکل با دو هستهٔ مختلف
-پشتیبانی می‌کند:
+یک نصب‌کنندهٔ تک‌فایلی برای ساخت تونل با **یک فورواردر Local و یک یا چند Receiver
+خارج** که پورت‌ها را از یک سرور محلی (مثلاً داخل ایران) به سرورهای خارج منتقل
+می‌کند. از چند پروتکل با دو هستهٔ مختلف پشتیبانی می‌کند:
 
 - **Xray-core** — پروتکل‌های `VLESS`، `VMESS`، `Trojan`، `Shadowsocks`، `SOCKS`
 - **Hysteria2** (`apernet/hysteria`) — انتقال بومی روی UDP با اوبفوسکیشن Salamander
@@ -320,7 +341,7 @@ Released under the [MIT License](LICENSE).
 
 - اوبونتو / دبیان **x86_64/amd64** با `systemd`
 - دسترسی `root` (با `sudo` یا کاربر root اجرا کنید)
-- دو سرور (یکی خارج، یکی محلی)
+- یک سرور Local و یک یا چند سرور Remote
 - برای گواهی TLS **واقعی**: یک دامنه که به IP سرور خارج اشاره کند و پورت TCP شمارهٔ
   **۸۰** آزاد باشد (چالش standalone در Let's Encrypt)
 
@@ -340,7 +361,7 @@ Released under the [MIT License](LICENSE).
 این دستور را روی **هر دو** سرور (با کاربر root) اجرا کنید و به سؤال‌ها پاسخ دهید:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/infowild/Wild-Tunnel-V1/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/infowild/Wild-Tunnel-V1/wild-tunnel-v2/install.sh)
 ```
 
 > از فرم `bash <(curl ...)` استفاده کنید، **نه** `curl ... | bash` — چون نصب‌کننده
@@ -352,11 +373,30 @@ bash <(curl -fsSL https://raw.githubusercontent.com/infowild/Wild-Tunnel-V1/main
 به‌جای آن می‌توانید مخزن را کلون کنید و نصب‌کننده را اجرا کنید:
 
 ```bash
-git clone https://github.com/infowild/Wild-Tunnel-V1.git wild-tunnel
+git clone --branch wild-tunnel-v2 --single-branch https://github.com/infowild/Wild-Tunnel-V1.git wild-tunnel
 cd wild-tunnel
 chmod +x install.sh
 sudo ./install.sh
 ```
+
+### ارتقای نصب موجود بدون Uninstall
+
+نصب‌کنندهٔ v2 بالا را ابتدا روی **سرور خارج** و سپس روی **سرور ایران** دریافت و اجرا
+کنید. گزینه‌های Install را دوباره انتخاب نکنید؛ از مسیر زیر استفاده کنید:
+
+```text
+3) Management menu
+7) Edit Configuration
+a) Apply changes
+```
+
+گزینهٔ `Apply` سرویس و کانفیگ را از روی `/etc/wild-tunnel/wild.conf` بازسازی می‌کند و
+اطلاعات ورود، کلیدهای REALITY و گواهی قابل‌بازیابی فعلی را نگه می‌دارد. در نصب Local
+قدیمی، یک‌بار وارد **Manage Locations / Load Balancing** شوید تا اتصال فعلی به
+location اول مهاجرت کند؛ برای فعال‌کردن مسیر forwarding نسخهٔ v2 نیز
+**Forwarding Mode** را روی `direct` بگذارید و سپس Apply کنید. اگر فایل
+`/etc/wild-tunnel/wild.conf` وجود ندارد، ادامه ندهید؛ نصب فعلی state قابل‌مهاجرت امن
+ندارد.
 
 از شما خواسته می‌شود یک نقش انتخاب کنید:
 
@@ -394,6 +434,7 @@ sudo ./install.sh
 
 ### مولتی‌لوکیشن و مولتی‌پورت
 
+- مولتی‌لوکیشن فقط روی **سرور ایران (Local)** تنظیم می‌شود؛ این سرور چند Receiver مستقل خارج را تجمیع می‌کند. گزینهٔ نصب **۱** را جداگانه روی هر سرور خارج اجرا کنید؛ سمت خارج عمداً سؤال افزودن location ندارد. گزینهٔ نصب **۲** روی ایران، بعد از Forward Portهای location اول سؤال `Add another remote location now?` را نمایش می‌دهد.
 - هر location شامل endpoint خارج، پروتکل، اطلاعات ورود، امنیت و فهرست پورت‌های تونل خودش است؛ locationها می‌توانند ترکیبی از پروتکل‌های Xray و Hysteria2 باشند.
 - هر پورت Xray یک مسیر outbound مستقل می‌شود. Hysteria2 فهرست/بازهٔ پورت را به‌صورت port hopping بومی استفاده می‌کند و برای هر location آن یک کلاینت systemd جدا ساخته می‌شود.
 - استراتژی پیش‌فرض `leastLoad` وقتی بیش از یک مسیر واجدشرایط وجود دارد با health observation خود Xray مسیر سالم‌تر را انتخاب و fallback نگه می‌دارد. نصب تک‌مسیر مستقیم route می‌شود و health probe دوره‌ای نمی‌فرستد. گزینه‌های `leastPing`، `roundRobin` و `random` نیز از مسیر `wild` → **Edit configuration** → **Manage Locations / Load Balancing** در دسترس‌اند.
